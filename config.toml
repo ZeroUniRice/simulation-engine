@@ -1,0 +1,64 @@
+[universe]
+width_nm = 5000000.0 # 5000 um
+height_nm = 5000000.0 # 5000 um
+boundary_conditions = "reflect" # Currently only reflect is implemented
+
+[cell_params]
+diameter_um = 47.0
+speed_um_per_min = 0.76
+persistence_min = 12.3
+division_radius_add_um = 3.0 # Makes Rd = 23.5 + 3.0 = 26.5 um
+sensing_radius_add_um = 3.0  # Makes Rs = 26.5 um
+max_division_rate_per_hr = 0.04
+coeff_scatter = 0.8 #
+density_bias_strength = 0.0 # Strength of bias towards lower density (used by DensityGradient bias)
+
+# Configuration for bias mechanisms affecting cell movement
+[bias]
+# Primary bias mode determines the main directional influence during interactions.
+# Options: "none", "leaders", "density_gradient"
+primary_bias = "none"
+
+# --- Settings for primary_bias = "leaders" ---
+# Percentage of cells closest to the wound edge designated as leaders.
+leader_percentage = 0.05 # e.g., 0.05 for 5%
+# How often (in simulation steps) to re-evaluate which cells are leaders.
+# Set to 0 to only determine leaders once at the start.
+leader_update_interval_steps = 100
+# Strength (0-1) of the directional bias towards the nearest leader during collision.
+leader_bias_strength = 0.3
+
+# --- Settings for primary_bias = "density_gradient" ---
+# Uses cell_params.density_bias_strength
+
+# --- Settings for secondary adhesion bias ---
+# Enable adhesion mechanism?
+enable_adhesion = false
+# Probability (0-1) that a cell adheres to a neighbor upon collision.
+adhesion_probability = 0.1
+# Strength (0-1) of the adhesion effect, influencing movement direction towards the adhered neighbor.
+adhesion_strength = 0.8
+
+
+[timing]
+physics_dt_min = 0.1       # Timestep
+total_time_min = 4800.0    # Simulate for 20 hours
+record_interval_min = 1.0  # Save state every 5 minutes (or log status)
+
+[initial_conditions]
+num_cells_initial = 5000
+wound_type = "straight_edge" # Cells start on left half
+wound_param1 = 2500000.0      # X position of the edge (in nm)
+wound_param2 = 0.0           # Unused for straight_edge
+initial_placement_seed = 54321
+
+# Removed GPU section, added Rayon config (optional, Rayon usually auto-detects)
+[cpu]
+# num_threads = 8 # Optional: Set number of threads for Rayon thread pool
+
+[output]
+base_filename = "wound_healing_sim_cpu_no_bias"
+save_positions = true
+save_stats = true
+save_positions_in_snapshot = true
+format = "bincode"  # Options: "json", "bincode", "messagepack"
