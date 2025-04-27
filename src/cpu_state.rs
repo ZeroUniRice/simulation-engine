@@ -1,5 +1,4 @@
-use crate::config::SimulationConfig;
-use crate::sim_params::SimParams;
+use simulation_common::{SimulationConfig, SimParams}; // Use shared crate
 use anyhow::Result;
 
 /// Holds the simulation state vectors on the CPU.
@@ -7,7 +6,7 @@ use anyhow::Result;
 pub struct CpuState {
     pub params: SimParams,
     pub num_particles: u32,
-    capacity: u32,
+    pub capacity: u32,
 
     // --- Ping-Pong Buffers for Parallel Update ---
     // Positions (current step's input)
@@ -44,47 +43,69 @@ pub struct CpuState {
     /// Flag indicating if a cell is a designated leader (1) or follower (0).
     /// Updated periodically based on config, not ping-pong buffered.
     pub is_leader: Vec<u8>,
+    /// Indices of the particles currently marked as leaders. Updated by `update_leaders`.
+    /// This serves as a cache for quick lookup in the physics step.
+    pub current_leader_indices: Vec<u32>,
     // Add other bias-related state here if needed (e.g., adhesion links)
 }
 
 impl CpuState {
     /// Creates a new CpuState, allocating vectors based on initial conditions and config.
+    /// All vectors are initialized to the same initial_capacity.
     pub fn new(
         initial_pos_x: &[f32],
         initial_pos_y: &[f32],
         initial_orient: &[f32],
         config: &SimulationConfig,
     ) -> Result<Self> {
-        let num_initial = initial_pos_x.len() as u32;
+        let num_initial = initial_pos_x.len();
+        let num_initial_u32 = num_initial as u32;
         // Start with a capacity slightly larger than initial to avoid immediate reallocations
-        let initial_capacity = (num_initial as f32 * 1.2).ceil() as u32;
+        // Ensure capacity is at least num_initial.
+        let initial_capacity = ((num_initial_u32 as f32 * 1.2).ceil() as u32).max(num_initial_u32);
+        let initial_capacity_usize = initial_capacity as usize;
+
         let params = config.get_sim_params();
         let num_grid_cells = params.num_grid_cells as usize;
 
+        // Initialize ALL vectors with initial_capacity_usize length.
+        let mut positions_x_in = vec![0.0; initial_capacity_usize];
+        let mut positions_y_in = vec![0.0; initial_capacity_usize];
+        let mut orientations_in = vec![0.0; initial_capacity_usize];
+
+        // Copy initial data into the beginning of the _in buffers.
+        if num_initial > 0 {
+            positions_x_in[..num_initial].copy_from_slice(initial_pos_x);
+            positions_y_in[..num_initial].copy_from_slice(initial_pos_y);
+            orientations_in[..num_initial].copy_from_slice(initial_orient);
+        }
+
         Ok(Self {
             params,
-            num_particles: num_initial,
-            capacity: initial_capacity,
+            num_particles: num_initial_u32, // Tracks active particles
+            capacity: initial_capacity,     // Tracks allocated size (and current vector length)
 
-            positions_x_in: initial_pos_x.to_vec(),
-            positions_y_in: initial_pos_y.to_vec(),
-            orientations_in: initial_orient.to_vec(),
+            // All vectors now have length initial_capacity_usize
+            positions_x_in,
+            positions_y_in,
+            orientations_in,
 
-            positions_x_out: vec![0.0; initial_capacity as usize],
-            positions_y_out: vec![0.0; initial_capacity as usize],
-            orientations_out: vec![0.0; initial_capacity as usize],
+            positions_x_out: vec![0.0; initial_capacity_usize],
+            positions_y_out: vec![0.0; initial_capacity_usize],
+            orientations_out: vec![0.0; initial_capacity_usize],
 
-            particle_grid_indices: vec![0; initial_capacity as usize],
-            cell_counts: vec![0; num_grid_cells],
-            cell_starts: vec![0; num_grid_cells],
-            cell_particle_indices: vec![0; initial_capacity as usize],
+            particle_grid_indices: vec![0; initial_capacity_usize],
+            cell_counts: vec![0; num_grid_cells], // Length depends on grid size
+            cell_starts: vec![0; num_grid_cells], // Length depends on grid size
+            cell_particle_indices: vec![0; initial_capacity_usize],
 
-            cell_density: vec![0.0; num_grid_cells],
-            density_gradient_x: vec![0.0; num_grid_cells],
-            density_gradient_y: vec![0.0; num_grid_cells],
+            cell_density: vec![0.0; num_grid_cells], // Length depends on grid size
+            density_gradient_x: vec![0.0; num_grid_cells], // Length depends on grid size
+            density_gradient_y: vec![0.0; num_grid_cells], // Length depends on grid size
 
-            divide_flags: vec![0; initial_capacity as usize],
-            is_leader: vec![0; initial_capacity as usize], // Initialize leader flags
+            divide_flags: vec![0; initial_capacity_usize],
+            is_leader: vec![0; initial_capacity_usize],
+            current_leader_indices: Vec::new(), // Built dynamically, capacity managed separately
         })
     }
 
@@ -102,10 +123,11 @@ impl CpuState {
         // self.orientations_out[..self.num_particles as usize].fill(0.0);
     }
 
-    /// Ensures all state vectors have enough capacity for `required_capacity` particles.
+    /// Ensures all state vectors have enough capacity (length) for `required_capacity` particles.
     pub fn ensure_capacity(&mut self, required_capacity: u32) {
         if required_capacity > self.capacity {
-            let new_capacity = (required_capacity as f32 * 1.2).ceil() as u32; // Grow by 20%
+            // Grow capacity by 20%, ensuring it meets the required capacity.
+            let new_capacity = (required_capacity as f32 * 1.2).ceil() as u32;
             log::info!(
                 "Resizing state vectors from {} to {} capacity.",
                 self.capacity,
@@ -113,7 +135,8 @@ impl CpuState {
             );
             let new_capacity_usize = new_capacity as usize;
 
-            // Resize ping-pong buffers
+            // Resize all per-particle vectors to the new length.
+            // resize adjusts the vector's length, filling new elements with the provided value.
             self.positions_x_in.resize(new_capacity_usize, 0.0);
             self.positions_y_in.resize(new_capacity_usize, 0.0);
             self.orientations_in.resize(new_capacity_usize, 0.0);
@@ -121,42 +144,56 @@ impl CpuState {
             self.positions_y_out.resize(new_capacity_usize, 0.0);
             self.orientations_out.resize(new_capacity_usize, 0.0);
 
-            // Resize grid and other buffers
             self.particle_grid_indices.resize(new_capacity_usize, 0);
             self.cell_particle_indices.resize(new_capacity_usize, 0);
             self.divide_flags.resize(new_capacity_usize, 0);
-            self.is_leader.resize(new_capacity_usize, 0); // Resize leader flags
+            self.is_leader.resize(new_capacity_usize, 0);
 
             // Grid cell buffers (cell_counts, cell_starts, density fields) depend on num_grid_cells,
             // which doesn't change, so they don't need resizing here.
 
+            // Update the tracked capacity.
             self.capacity = new_capacity;
         }
     }
 
-    /// Adds a new particle to the state vectors (at the end).
-    /// Assumes `ensure_capacity` has already been called.
+
+    /// Adds a new particle to the state vectors (at the end of the active region).
+    /// Assumes `ensure_capacity` has already been called to ensure sufficient vector length.
     pub fn add_particle(&mut self, x: f32, y: f32, orientation: f32) {
         let idx = self.num_particles as usize;
+
+        // Check if the index is within the current vector length (which equals capacity).
+        // This check should always pass if ensure_capacity was called correctly.
         if idx < self.capacity as usize {
-            // Add to the '_in' buffers, as these represent the current state
-            // after a potential swap and before the next physics step.
+            // Write directly into the allocated slot using the current particle count as the index.
             self.positions_x_in[idx] = x;
             self.positions_y_in[idx] = y;
             self.orientations_in[idx] = orientation;
-            // Initialize other per-particle state
+
+            // Initialize other per-particle state at this index.
             self.divide_flags[idx] = 0;
             self.is_leader[idx] = 0; // New cells start as followers
-            // particle_grid_indices and cell_particle_indices will be overwritten in the next build_grid.
 
+            // Initialize output buffers and grid indices for the new particle as well.
+            // These might be overwritten later, but initializing avoids stale data.
+            self.positions_x_out[idx] = 0.0; // Initialize corresponding _out slot
+            self.positions_y_out[idx] = 0.0;
+            self.orientations_out[idx] = 0.0;
+            self.particle_grid_indices[idx] = 0; // Initialize grid index
+            // cell_particle_indices is fully rebuilt, no need to initialize here.
+
+            // Increment particle count *after* successfully writing data.
             self.num_particles += 1;
         } else {
-            // This should not happen if ensure_capacity was called correctly.
+            // This indicates a problem: ensure_capacity wasn't called or logic error.
             log::error!(
-                "Attempted to add particle beyond capacity! num_particles: {}, capacity: {}",
+                "Attempted to add particle at index {} beyond vector capacity {}! num_particles: {}",
+                idx,
+                self.capacity,
                 self.num_particles,
-                self.capacity
             );
+            // Depending on desired robustness, could panic or return an error here.
         }
     }
 }

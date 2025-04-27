@@ -1,5 +1,4 @@
-use crate::vecmath::Vec2;
-use crate::sim_params::SimParams;
+use simulation_common::{SimParams, Vec2}; // Use shared crate
 
 // Calculates the 1D grid cell index for a given position
 #[inline(always)]
@@ -79,11 +78,11 @@ where
                                 }
                             }
                         } else {
-                             eprintln!("Warning: Neighbor index {} out of bounds during neighbor search for particle {}.", neighbor_idx, particle_idx);
+                            log::error!("Warning: Neighbor index {} out of bounds during neighbor search for particle {}.", neighbor_idx, particle_idx);
                         }
                     }
                 } else {
-                     eprintln!("Warning: Grid index {} out of bounds for cell_starts/cell_counts.", grid_idx);
+                    log::error!("Warning: Grid index {} out of bounds for cell_starts/cell_counts.", grid_idx);
                 }
             }
         }
@@ -155,11 +154,11 @@ pub fn for_each_neighbor<F>(
                             }
                         } else {
                              // This indicates an indexing error somewhere upstream
-                             eprintln!("Warning: Neighbor index {} out of bounds during neighbor search for particle {}.", neighbor_idx, particle_idx);
+                             log::error!("Warning: Neighbor index {} out of bounds during neighbor search for particle {}.", neighbor_idx, particle_idx);
                         }
                     }
                 } else {
-                     eprintln!("Warning: Grid index {} out of bounds for cell_starts/cell_counts.", grid_idx);
+                    log::error!("Warning: Grid index {} out of bounds for cell_starts/cell_counts.", grid_idx);
                 }
             }
         }

@@ -1,4 +1,3 @@
-// No no_std needed here
 use serde::{Deserialize, Serialize};
 
 /// Simulation parameters derived from the configuration, used frequently during simulation steps.

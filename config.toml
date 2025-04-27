@@ -10,14 +10,15 @@ persistence_min = 12.3
 division_radius_add_um = 3.0 # Makes Rd = 23.5 + 3.0 = 26.5 um
 sensing_radius_add_um = 3.0  # Makes Rs = 26.5 um
 max_division_rate_per_hr = 0.04
-coeff_scatter = 0.8 #
-density_bias_strength = 0.0 # Strength of bias towards lower density (used by DensityGradient bias)
+coeff_scatter = 1 #
+density_bias_strength = 0.8 # Strength of bias towards lower density (used by DensityGradient bias)
 
 # Configuration for bias mechanisms affecting cell movement
 [bias]
 # Primary bias mode determines the main directional influence during interactions.
-# Options: "none", "leaders", "density_gradient"
-primary_bias = "none"
+# Options: "none", "leaders", "densitygradient"
+primary_bias = "leaders"
+density_gradient_update_interval_steps = 100
 
 # --- Settings for primary_bias = "leaders" ---
 # Percentage of cells closest to the wound edge designated as leaders.
@@ -26,7 +27,7 @@ leader_percentage = 0.05 # e.g., 0.05 for 5%
 # Set to 0 to only determine leaders once at the start.
 leader_update_interval_steps = 100
 # Strength (0-1) of the directional bias towards the nearest leader during collision.
-leader_bias_strength = 0.3
+leader_bias_strength = 0.8
 
 # --- Settings for primary_bias = "density_gradient" ---
 # Uses cell_params.density_bias_strength
@@ -41,9 +42,9 @@ adhesion_strength = 0.8
 
 
 [timing]
-physics_dt_min = 0.1       # Timestep
-total_time_min = 4800.0    # Simulate for 20 hours
-record_interval_min = 1.0  # Save state every 5 minutes (or log status)
+physics_dt_min = 0.05       # Timestep
+total_time_min = 9600.0    
+record_interval_min = 5.0  # Save state every 5 minutes (or log status)
 
 [initial_conditions]
 num_cells_initial = 5000
@@ -57,8 +58,9 @@ initial_placement_seed = 54321
 # num_threads = 8 # Optional: Set number of threads for Rayon thread pool
 
 [output]
-base_filename = "wound_healing_sim_cpu_no_bias"
+base_filename = "wound_healing_sim_cpu_leaders"
 save_positions = true
 save_stats = true
 save_positions_in_snapshot = true
 format = "bincode"  # Options: "json", "bincode", "messagepack"
+streaming_snapshots = true 

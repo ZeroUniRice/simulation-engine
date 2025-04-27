@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use anyhow::Result;
-use crate::sim_params::SimParams;
+use crate::sim_params::SimParams; // Use crate::sim_params
 use std::path::Path;
 
 // Configuration for universe properties
@@ -134,7 +134,7 @@ impl SimulationConfig {
     /// Loads the simulation configuration from a TOML file.
     pub fn load<P: AsRef<Path>>(path: P) -> Result<Self> {
         let path_ref = path.as_ref();
-        
+
         let config_str = std::fs::read_to_string(path_ref)
             .map_err(|e| anyhow::anyhow!("Failed to read config file '{}': {}", path_ref.display(), e))?;
         let config: SimulationConfig = toml::from_str(&config_str)
@@ -147,13 +147,14 @@ impl SimulationConfig {
         if config.initial_conditions.num_cells_initial == 0 {
             anyhow::bail!("num_cells_initial must be greater than 0.");
         }
+        // Add more validation as needed...
 
         Ok(config)
     }
 
     /// Converts the configuration into simulation parameters used at runtime.
     pub fn get_sim_params(&self) -> SimParams {
-        // --- Extract base values --- 
+        // --- Extract base values ---
         let diameter_um = self.cell_params.diameter_um;
         let speed_um_per_min = self.cell_params.speed_um_per_min;
         let persistence_min = self.cell_params.persistence_min;
@@ -163,7 +164,7 @@ impl SimulationConfig {
         let coeff_scatter = self.cell_params.coeff_scatter;
         let density_bias_strength = self.cell_params.density_bias_strength;
 
-        // --- Calculate derived values --- 
+        // --- Calculate derived values ---
         // World dimensions
         let world_width_um = self.universe.width_nm / 1000.0;
         let world_height_um = self.universe.height_nm / 1000.0;

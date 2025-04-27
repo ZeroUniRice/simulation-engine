@@ -295,14 +295,14 @@ def load_snapshots(input_path: str, chunk_size: int = 10) -> Iterator[Dict[str, 
                 # First check if the file is a Rust-bincode serialized array
                 if len(data) >= 8:  # At least length prefix
                     # First 8 bytes are a u64 length prefix in Rust bincode
-                    array_len = struct.unpack("<Q", data[:8])[0]
+                    array_len = struct.unpack("<I", data[:4])[0]
                     
                     if 0 < array_len < 1000000:  # Sanity check
                         print(f"Detected array of {array_len} items in binary file")
                         
                         # Read file in chunks to avoid loading everything into memory
                         # Starting after the 8-byte length prefix
-                        pos = 8
+                        pos = 4
                         
                         snapshots = []
                         chunk_snapshots_remaining = chunk_size
@@ -882,7 +882,6 @@ def main():
     
     # Estimate total snapshots for progress bar
     total_snapshots = count_total_snapshots(args.input)
-    print(f"Processing approximately {total_snapshots} snapshots...")
 
     # -- Initialize main process frame cache --
     main_cache = FrameCache(final_width_px, final_height_px, bg_color)

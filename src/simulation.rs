@@ -1,44 +1,20 @@
-use crate::config::{SimulationConfig, PrimaryBiasType};
+use simulation_common::{SimulationConfig, SimParams, Snapshot, Vec2, PrimaryBiasType, angle_to_vec, vec_to_angle, clamp}; // Use shared crate
 use crate::cpu_state::CpuState;
-use crate::sim_params::SimParams;
-use crate::vecmath::{Vec2, angle_to_vec, vec_to_angle, clamp};
 use crate::grid::{get_grid_cell_idx, for_each_neighbor, find_first_neighbor};
 use anyhow::Result;
-use log::{info, warn, error, debug, trace};
+use log::{info, warn, error, debug, trace}; // Ensure log macros are imported
 use rand::prelude::*;
-use rand::distr::Uniform;
+use rand::distr::{Uniform, Distribution};
+use rand_distr::Normal;
 use rand::seq::SliceRandom;
 use rayon::prelude::*;
-use serde::{Serialize, Deserialize};
+use std::fs::File;
+use std::io::{BufWriter, Write, Seek};
+use std::sync::Mutex;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-/// A snapshot of the simulation state and metrics at a specific time.
-#[derive(Debug, Clone, Serialize, Deserialize)] // Derive traits for easy saving/loading
-pub struct Snapshot {
-    /// The simulation time (in minutes) at which the snapshot was taken.
-    pub time: f32,
-    /// The total number of particles/cells in the simulation.
-    pub total_particle_count: u32,
-    /// The number of cell centers located within the defined wound area (A_i).
-    pub cell_count_in_wound: u32,
-    /// The average density of cells in the wound area (cells per um^2).
-    /// Calculated based on `cell_count_in_wound` and the defined `A_i` area.
-    pub average_density_in_wound: f32, // Added for convenience
-    /// The calculated density in each grid cell (cells per um^2).
-    /// Represents the density profile rho(x, t).
-    pub grid_cell_densities: Vec<f32>,
-    /// A histogram of neighbor counts: `neighbor_counts_distribution[N]` stores the number of cells with exactly N neighbors within R_s.
-    /// The vector index corresponds to the number of neighbors N.
-    pub neighbor_counts_distribution: Vec<u32>,
-    /// Optional: Raw [x, y] positions of all cells at the snapshot time.
-    /// Included only if `config.output.save_positions_in_snapshot` is true.
-    #[serde(skip_serializing_if = "Option::is_none")] // Don't write "positions": null
-    pub positions: Option<Vec<(f32, f32)>>,
-    // Future metrics could be added here:
-    // pub average_speed: f32,
-    // pub average_persistence_ratio: f32, // Velocity correlation with previous step
-    // pub cell_positions: Option<Vec<(f32, f32)>>, // Optional: save all positions per snapshot (can be very large)
-}
+pub const MAX_EXPECTED_NEIGHBORS: usize = 19;
 
 /// Manages the state and execution of the collective cell migration simulation on the CPU.
 pub struct CpuSimulation {
@@ -54,22 +30,40 @@ pub struct CpuSimulation {
     atomic_cell_write_offsets: Vec<AtomicU32>,
     /// Stores collected simulation data snapshots at record intervals.
     recorded_snapshots: Vec<Snapshot>, // Add this field
+    // New field for incremental snapshot writing
+    snapshot_writer: SnapshotWriter,
+    snapshot_count: u32, // Track number of snapshots written
+    /// Store a reference density gradient that is calculated once and used consistently
+    reference_density_gradient_x: Vec<f32>,
+    reference_density_gradient_y: Vec<f32>,
+    reference_gradient_initialized: bool,
 }
 
-const MAX_EXPECTED_NEIGHBORS: usize = 20; // Define a reasonable max neighbor count for histogram vector size
+/// Define an enum for incremental snapshot writing options
+#[derive(Debug, Clone)]
+pub enum SnapshotWriter {
+    None,
+    Bincode(Arc<Mutex<BufWriter<File>>>),
+    // Could add other formats like MessagePack, JSON, etc.
+}
 
 impl CpuSimulation {
     /// Creates a new `CpuSimulation` instance, initializing state and placing initial cells.
     pub fn new(config: SimulationConfig) -> Result<Self> {
+        debug!("Initializing CpuSimulation...");
         // Initialize the main host-side RNG for initial placement and serial division.
         // The seed for this RNG is taken from the initial_placement_seed in the config.
+        debug!("Initializing main RNG with seed: {}", config.initial_conditions.initial_placement_seed);
         let mut rng = StdRng::seed_from_u64(config.initial_conditions.initial_placement_seed);
 
         // Place initial cells based on config. This is a serial CPU step.
+        debug!("Placing initial cells...");
         let initial_positions = place_initial_cells(&config, &mut rng)?;
         let num_initial = initial_positions.len();
+        info!("Placed {} initial cells.", num_initial); // Info level for this milestone
 
         // Separate positions into x and y vectors for SoA layout.
+        debug!("Separating initial positions into SoA layout...");
         let mut initial_pos_x = Vec::with_capacity(num_initial);
         let mut initial_pos_y = Vec::with_capacity(num_initial);
         for pos in initial_positions {
@@ -78,15 +72,58 @@ impl CpuSimulation {
         }
 
         // Assign random initial orientations.
+        debug!("Assigning random initial orientations...");
         let angle_dist = Uniform::new(0.0f32, 2.0 * std::f32::consts::PI)?;
         let initial_orient: Vec<f32> = (0..num_initial).map(|_| rng.sample(angle_dist)).collect();
 
         // Initialize the main CPU state struct, allocating necessary vectors.
+        debug!("Initializing CpuState with {} particles...", num_initial);
         let state = CpuState::new(&initial_pos_x, &initial_pos_y, &initial_orient, &config)?;
+        debug!("CpuState initialized with capacity: {}", state.capacity);
 
         // Initialize atomic counters needed for parallel grid building.
         let num_grid_cells = state.params.num_grid_cells as usize;
+        debug!("Initializing {} atomic counters for grid building...", num_grid_cells);
         let atomic_cell_write_offsets = (0..num_grid_cells).map(|_| AtomicU32::new(0)).collect();
+
+        // Initialize snapshot writer based on config settings
+        let snapshot_writer = if config.output.save_stats && config.output.streaming_snapshots {
+            let format = config.output.format.as_deref().unwrap_or("bincode");
+            match format {
+                "bincode" => {
+                    let filename = format!("{}_snapshots.bin", config.output.base_filename);
+                    match File::create(&filename) {
+                        Ok(file) => {
+                            let mut writer = BufWriter::with_capacity(256 * 1024, file);
+                            // Write a placeholder for the count, which will be updated at the end
+                            let placeholder_count: u32 = 0;
+                            match bincode::serialize_into(&mut writer, &placeholder_count) {
+                                Ok(_) => {
+                                    info!("Initialized incremental bincode writer to {}", filename);
+                                    SnapshotWriter::Bincode(Arc::new(Mutex::new(writer)))
+                                },
+                                Err(e) => {
+                                    error!("Failed to initialize bincode writer: {}", e);
+                                    SnapshotWriter::None
+                                }
+                            }
+                        },
+                        Err(e) => {
+                            error!("Failed to create snapshot file '{}': {}", filename, e);
+                            SnapshotWriter::None
+                        }
+                    }
+                },
+                _ => {
+                    warn!("Incremental snapshot writing is only supported for bincode format.");
+                    SnapshotWriter::None
+                }
+            }
+        } else {
+            SnapshotWriter::None
+        };
+
+        let num_grids = state.params.num_grid_cells as usize;
 
         let mut sim = Self {
             config,
@@ -95,15 +132,24 @@ impl CpuSimulation {
             current_time_step: 0,
             atomic_cell_write_offsets,
             recorded_snapshots: Vec::new(),
+            snapshot_writer,
+            snapshot_count: 0,
+            reference_density_gradient_x: vec![0.0; num_grids],
+            reference_density_gradient_y: vec![0.0; num_grids],
+            reference_gradient_initialized: false,
         };
+        debug!("CpuSimulation struct created.");
 
         // Initial leader update if configured
         if sim.config.bias.primary_bias == PrimaryBiasType::Leaders
             && sim.params().leader_update_interval_steps == 0
         {
+            debug!("Performing initial leader update...");
             sim.update_leaders()?;
+            debug!("Initial leader update complete.");
         }
 
+        debug!("CpuSimulation initialization complete.");
         Ok(sim)
     }
 
@@ -116,7 +162,7 @@ impl CpuSimulation {
         if self.config.bias.primary_bias == PrimaryBiasType::Leaders {
             let interval = self.params().leader_update_interval_steps;
             if interval > 0 && self.current_time_step % interval == 0 {
-                self.update_leaders()?;
+                self.update_leaders()?
             }
         }
 
@@ -124,7 +170,27 @@ impl CpuSimulation {
         self.build_grid_parallel()?;
 
         // --- 2. Calculate Density and Gradient (Parallel) ---
-        self.calculate_density_fields_parallel()?;
+        // For density gradient bias, we calculate density fields at the beginning 
+        // and then periodically according to the update interval
+        let should_update_density = 
+            self.current_time_step == 0 || // Always calculate on first step
+            (self.config.bias.primary_bias == PrimaryBiasType::DensityGradient && 
+             self.params().density_gradient_update_interval_steps > 0 && 
+             self.current_time_step % self.params().density_gradient_update_interval_steps == 0);
+
+        if should_update_density {
+            debug!("Calculating density fields at step {}", self.current_time_step);
+            self.calculate_density_fields_parallel()?;
+            
+            // If using density gradient bias, maintain reference gradient for consistent direction
+            if self.config.bias.primary_bias == PrimaryBiasType::DensityGradient && !self.reference_gradient_initialized {
+                // Store the initial reference gradients to maintain consistent direction
+                debug!("Setting up reference density gradient");
+                self.reference_density_gradient_x.copy_from_slice(&self.state.density_gradient_x);
+                self.reference_density_gradient_y.copy_from_slice(&self.state.density_gradient_y);
+                self.reference_gradient_initialized = true;
+            }
+        }
 
         // --- 3. Update Physics (Parallel) ---
         self.update_physics_parallel()?;
@@ -183,10 +249,10 @@ impl CpuSimulation {
                 if grid_idx < self.state.cell_counts.len() {
                     self.state.cell_counts[grid_idx] += 1;
                 } else {
-                    eprintln!("Warning: Grid index {} out of bounds for cell_counts (len {}). PIdx: {}.", grid_idx, self.state.cell_counts.len(), i);
+                    error!("Warning: Grid index {} out of bounds for cell_counts (len {}). PIdx: {}.", grid_idx, self.state.cell_counts.len(), i);
                 }
             } else {
-                eprintln!("Warning: Particle {} assigned invalid grid index {}. World: {}x{}.",
+                error!("Warning: Particle {} assigned invalid grid index {}. World: {}x{}.",
                     i, grid_idx, params.world_width, params.world_height);
             }
         }
@@ -203,7 +269,7 @@ impl CpuSimulation {
             total_sum += count;
         }
         if total_sum != num_particles as u32 {
-            eprintln![
+            error![
                 "Warning: Grid build prefix sum total ({}) does not match particle count ({}). Check counting logic.",
                 total_sum, num_particles
             ];
@@ -229,10 +295,10 @@ impl CpuSimulation {
                 // Get the grid index for this particle.
                 // Bounds check for reading from particle_grid_indices_slice
                 if particle_idx_usize >= particle_grid_indices_slice.len() {
-                    eprintln!("Warning: particle_idx_usize {} out of bounds for particle_grid_indices_slice (len {}). Skipping.", particle_idx_usize, particle_grid_indices_slice.len());
+                    error!("Warning: particle_idx_usize {} out of bounds for particle_grid_indices_slice (len {}). Skipping.", particle_idx_usize, particle_grid_indices_slice.len());
                     return None; // Skip this particle if index is out of bounds
                 }
-                let grid_idx = particle_grid_indices_slice[particle_idx_usize] as usize;
+                let grid_idx: usize = particle_grid_indices_slice[particle_idx_usize] as usize;
 
                 // Determine the write position using the atomic offset.
                 // Bounds check for reading from cell_starts_slice and atomic_offsets_slice
@@ -245,7 +311,7 @@ impl CpuSimulation {
                     // Return the calculated write index and the original particle index.
                     Some((final_write_idx, particle_idx))
                 } else {
-                    eprintln!("Warning: Grid index {} out of bounds for cell_starts/atomic_offsets during sort build. PIdx: {}. Skipping.", grid_idx, particle_idx);
+                    error!("Warning: Grid index {} out of bounds for cell_starts/atomic_offsets during sort build. PIdx: {}. Skipping.", grid_idx, particle_idx);
                     None // Skip if grid index is invalid
                 }
             })
@@ -270,7 +336,7 @@ impl CpuSimulation {
             } else {
                 // This indicates an error in prefix sum, atomic counting, or collection logic,
                 // or potentially that cell_particle_indices is too small.
-                eprintln!(
+                error!(
                     "Warning: Calculated final_write_idx {} out of bounds for cell_particle_indices (len {}). PIdx: {}. Skipping write.",
                     final_write_idx, cell_particle_indices_len, particle_idx
                 );
@@ -284,7 +350,7 @@ impl CpuSimulation {
         // Ensure you have a suitable sentinel value if using this.
         // for i in 0..num_particles {
         //     if self.state.cell_particle_indices[i] == u32::MAX { // Assuming u32::MAX was used as sentinel
-        //         eprintln!("Warning: Slot {} in cell_particle_indices was not written to.", i);
+        //         error!("Warning: Slot {} in cell_particle_indices was not written to.", i);
         //     }
         // }
 
@@ -369,8 +435,7 @@ impl CpuSimulation {
         let cell_counts_slice = &self.state.cell_counts;
         // Capture bias-related state and params
         let is_leader_slice = &self.state.is_leader;
-        let density_gradient_x_slice = &self.state.density_gradient_x;
-        let density_gradient_y_slice = &self.state.density_gradient_y;
+        let current_leader_indices_slice = &self.state.current_leader_indices; // Capture leader indices cache
 
         self.state.positions_x_out[..num_particles]
             .par_iter_mut()
@@ -389,9 +454,92 @@ impl CpuSimulation {
                 let current_theta = orientations_in_slice[idx];
 
                 // --- 1. Determine Intended Direction (Persistence/Random) ---
-                let p_change = 1.0 - (-params.dt * params.inv_p).exp();
+                // Original persistence model: cells only change direction with probability p_change
+                // This limits how often biases can be applied, causing stagnant behavior
+                let p_change: f32 = 1.0 - (-params.dt * params.inv_p).exp();
+                
+                // MODIFIED: Increase the chance of changing direction to make biases more effective
+                // For bias-driven simulations, we'll always check the bias direction but blend with persistence
                 let mut theta_intended = current_theta;
-                if rng.sample(unit_dist) < p_change {
+                
+                // Modified approach: Always check for bias if enabled, blend with persistence
+                if params.primary_bias_type > 0 { // Any bias type enabled
+                    // Calculate a bias direction
+                    let bias_dir_opt = if params.primary_bias_type == 1 && is_leader_slice[idx] == 0 {
+                        // Leader bias for followers
+                        let mut min_dist_sq = f32::MAX;
+                        let mut closest_leader_pos: Option<Vec2> = None;
+
+                        // Find closest leader
+                        for &leader_idx_u32 in current_leader_indices_slice {
+                            let leader_idx = leader_idx_u32 as usize;
+                            if leader_idx < num_particles && leader_idx != idx &&
+                               leader_idx < pos_x_in_slice.len() && leader_idx < pos_y_in_slice.len() {
+                                let leader_pos = Vec2::new(pos_x_in_slice[leader_idx], pos_y_in_slice[leader_idx]);
+                                let dist_sq = current_pos.distance_squared(leader_pos);
+                                if dist_sq < min_dist_sq {
+                                    min_dist_sq = dist_sq;
+                                    closest_leader_pos = Some(leader_pos);
+                                }
+                            }
+                        }
+                        
+                        // If we found a leader, create a bias angle toward it
+                        closest_leader_pos.map(|leader_pos| {
+                            match generate_leader_biased_direction(current_pos, leader_pos, params.leader_bias_strength, &mut rng) {
+                                Ok(angle) => angle,
+                                Err(_) => current_theta // Fall back to current direction on error
+                            }
+                        })
+                    } else if params.primary_bias_type == 2 {
+                        // Density gradient bias
+                        // Use the consistent reference gradients for bias calculation
+                        let gradient_bias_vec = calculate_consistent_density_gradient_bias(current_pos, &self.state.params, &self.reference_density_gradient_x, &self.reference_density_gradient_y);
+                        
+                        if gradient_bias_vec.length_squared() > 1e-12 {
+                            Some(vec_to_angle(gradient_bias_vec))
+                        } else {
+                            None // No significant gradient
+                        }
+                    } else {
+                        None // No valid bias type
+                    };
+                    
+                    // Blend the bias direction with the current direction based on persistence
+                    if let Some(bias_angle) = bias_dir_opt {
+                        // Base persistence effect on p_change, but make it less restrictive
+                        // This makes cells respond more immediately to biases while still maintaining some persistence
+                        let persistence_weight = (1.0 - p_change.min(0.5) * 1.5).max(0.1); // Increase effectiveness
+                        
+                        // Check if a direction change is needed by the persistence model or forced by a strong bias
+                        let bias_strength_factor = if params.primary_bias_type == 1 {
+                            params.leader_bias_strength
+                        } else {
+                            params.density_bias_strength
+                        };
+                        
+                        let bias_forcing = rng.sample(unit_dist) < bias_strength_factor * 0.5;
+                        
+                        if bias_forcing || rng.sample(unit_dist) < p_change {
+                            // New angle is a blend of current direction and bias direction
+                            let current_vec = angle_to_vec(current_theta);
+                            let bias_vec = angle_to_vec(bias_angle);
+                            
+                            // Weighted combination based on persistence factor
+                            let combined_vec = current_vec.scale(persistence_weight).add(bias_vec.scale(1.0 - persistence_weight));
+                            
+                            if combined_vec.length_squared() > 1e-12 {
+                                theta_intended = vec_to_angle(combined_vec.normalize_or_zero());
+                            } else {
+                                theta_intended = bias_angle; // Use pure bias if combined vector vanishes
+                            }
+                        }
+                    } else if rng.sample(unit_dist) < p_change {
+                        // No valid bias was found, use random direction with standard persistence model
+                        theta_intended = rng.sample(rand_angle_dist);
+                    }
+                } else if rng.sample(unit_dist) < p_change {
+                    // No bias active - use original persistence model (pure random)
                     theta_intended = rng.sample(rand_angle_dist);
                 }
 
@@ -412,8 +560,7 @@ impl CpuSimulation {
 
                 // --- 4. Calculate Base Movement (Collision Response or Intended) ---
                 let mut final_pos: Vec2;
-                let mut effective_theta: f32;
-                let mut move_vec_actual: Vec2; // The vector representing the actual displacement for this step
+                let effective_theta: f32; // Removed mut
 
                 if let Some(neighbor_idx) = collision_neighbor_idx_opt {
                     // --- Collision Detected --- 
@@ -452,15 +599,114 @@ impl CpuSimulation {
                         base_move_vec = angle_to_vec(base_theta).scale(params.s * params.dt);
                     }
 
-                    // --- BIAS APPLICATION POINT (Currently No Bias Applied) ---
-                    // In future, calculate bias_vec here based on params.primary_bias_type,
-                    // neighbor_idx, is_leader_slice, density_gradient slices etc.
-                    // let bias_vec = calculate_bias_vector(...);
-                    // let combined_move_vec = base_move_vec.add(bias_vec.scale(params.dt)); // Example
-                    let combined_move_vec = base_move_vec; // NO BIAS YET
+                    // --- BIAS CALCULATION ---
+                    let mut bias_vec = Vec2::zero(); // Use Vec2 from common
+
+                    // --- Primary Bias: Leaders ---
+                    if params.primary_bias_type == 1 && is_leader_slice[idx] == 0 { // Is a follower
+                        let mut min_dist_sq = f32::MAX;
+                        let mut closest_leader_pos: Option<Vec2> = None;
+
+                        // Iterate through the precomputed list of leader indices (cache)
+                        for &leader_idx_u32 in current_leader_indices_slice {
+                            let leader_idx = leader_idx_u32 as usize;
+                            // Basic check: ensure leader index is valid and not self
+                            if leader_idx < num_particles && leader_idx != idx {
+                                // Bounds check before accessing leader position
+                                if leader_idx < pos_x_in_slice.len() && leader_idx < pos_y_in_slice.len() {
+                                    let leader_pos = Vec2::new(pos_x_in_slice[leader_idx], pos_y_in_slice[leader_idx]);
+                                    let dist_sq = current_pos.distance_squared(leader_pos);
+                                    if dist_sq < min_dist_sq {
+                                        min_dist_sq = dist_sq;
+                                        closest_leader_pos = Some(leader_pos);
+                                    }
+                                } else {
+                                    // This might happen briefly if leaders are updated concurrently with physics
+                                    // or if num_particles changes unexpectedly. Log a warning.
+                                    warn!("Leader index {} out of bounds for position slices during bias calculation.", leader_idx);
+                                }
+                            }
+                        }
+
+                        if let Some(leader_pos) = closest_leader_pos {
+                            let dir_to_leader = (leader_pos.sub(current_pos)).normalize_or_zero();
+                            // Add leader bias to the bias vector, scaled by strength
+                            bias_vec = bias_vec.add(dir_to_leader.scale(params.leader_bias_strength)); // Use Vec2 methods
+                        }
+                    }
+                    // --- Primary Bias: Density Gradient ---
+                    else if params.primary_bias_type == 2 {
+                        // Use the stored reference gradients instead of the current gradients
+                        let gradient_bias_vec = calculate_consistent_density_gradient_bias(current_pos, &self.state.params, &self.reference_density_gradient_x, &self.reference_density_gradient_y);
+                        
+                        // Add the density bias to the bias vector, scaled by strength
+                        bias_vec = bias_vec.add(gradient_bias_vec.scale(params.density_bias_strength)); // Use Vec2 methods
+                    }
+
+                    // --- Secondary Bias: Adhesion (Placeholder) --- 
+                    // if params.enable_adhesion && rng.sample(unit_dist) < params.adhesion_probability { ... }
+
+                    // --- Combine Base Movement and Bias ---
+                    // Normalize the base movement direction (from collision response)
+                    let base_dir = base_move_vec.normalize_or_zero(); // Use Vec2 method
+
+                    // Calculate the angle between base_dir and bias_vec
+                    // This allows us to detect when they're pointing in opposite directions
+                    let dot_product = if bias_vec.length_squared() > 1e-12 {
+                        let bias_normalized = bias_vec.normalize_or_zero();
+                        base_dir.dot(bias_normalized)
+                    } else {
+                        0.0 // No bias, so no angle to consider
+                    };
+
+                    let final_dir = if dot_product < -0.9 {
+                        // Vectors are nearly opposite (within ~25 degrees of exactly opposite)
+                        // Instead of potentially canceling out, use a weighted blend favoring the bias
+                        // Also add a small perpendicular component to break symmetry
+                        
+                        // Get perpendicular direction to base_dir
+                        let perp_dir = Vec2::new(-base_dir.y, base_dir.x);
+                        
+                        // Create a blended direction favoring the bias, with perpendicular component
+                        if bias_vec.length_squared() > 1e-12 {
+                            // Strong bias contribution (70%) plus perpendicular component (30%)
+                            // to break the exact opposition
+                            let bias_dir = bias_vec.normalize_or_zero();
+                            let weighted_dir = bias_dir.scale(0.7).add(perp_dir.scale(0.3));
+                            weighted_dir.normalize_or_zero()
+                        } else {
+                            // Add just a perpendicular component if bias is too small
+                            warn!("Bias vector too small, using perpendicular direction only.");
+                            base_dir.scale(0.7).add(perp_dir.scale(0.3)).normalize_or_zero()
+                        }
+                    } else {
+                        // Vectors aren't directly opposing, use the original method
+                        
+                        // Apply a stronger bias effect to overcome normalization
+                        let bias_boost_factor = 3.0; // Keep the factor definition
+                        let boosted_bias_vec = bias_vec.scale(bias_boost_factor); // Use the boost factor
+
+                        // Add the boosted bias vector to the base direction
+                        let combined_dir_unnormalized = base_dir.add(boosted_bias_vec); // Use the boosted vector
+
+                        // Normalize the combined direction
+                        let combined_dir = combined_dir_unnormalized.normalize_or_zero(); // Use Vec2 method
+
+                        // Use the combined direction if it's valid, otherwise use a fallback
+                        if combined_dir.length_squared() > 1e-12 {
+                            combined_dir
+                        } else {
+                            // As a last resort (very rare now), use base_dir
+                            trace!("Combined direction still zero after anti-cancellation measures");
+                            base_dir
+                        }
+                    };
+
+                    // Scale the final direction by the standard movement distance
+                    let combined_move_vec = final_dir.scale(params.s * params.dt); // Use Vec2 method
 
                     // --- Apply Movement & Overlap Correction ---
-                    let pos_after_move = current_pos.add(combined_move_vec);
+                    let pos_after_move = current_pos.add(combined_move_vec); // Use Vec2 method
                     let neighbor_to_pos_after_move = pos_after_move.sub(neighbor_pos);
                     let dist_after_move_sq = neighbor_to_pos_after_move.length_squared();
 
@@ -475,7 +721,7 @@ impl CpuSimulation {
                     }
 
                     // Determine effective theta based on the *actual* displacement
-                    move_vec_actual = final_pos.sub(current_pos);
+                    let move_vec_actual = final_pos.sub(current_pos); // Calculate actual displacement
                     if move_vec_actual.length_squared() > 1e-12 {
                         effective_theta = vec_to_angle(move_vec_actual);
                     } else {
@@ -484,10 +730,9 @@ impl CpuSimulation {
                     }
 
                 } else {
-                    // --- No collision: Use intended movement --- 
+                    // --- No collision: Use intended movement ---
                     final_pos = tentative_pos;
                     effective_theta = theta_intended;
-                    move_vec_actual = move_vec_intended; // Actual move is the intended one
                 }
 
                 // --- 5. Apply Boundary Conditions (Reflection) ---
@@ -519,7 +764,7 @@ impl CpuSimulation {
                 *pos_x_out = final_pos.x;
                 *pos_y_out = final_pos.y;
                 *orientation_out = final_theta;
-            }); // End parallel loop over particles
+            }); // End parallel loop
 
         Ok(())
     }
@@ -587,11 +832,19 @@ impl CpuSimulation {
                 }); // End parallel flag marking
         } // End scope for params borrow
 
-        // --- Collect Parent Indices ---
+        // --- Collect Parent Indices and Leader Status ---
         let mut parent_indices = Vec::new();
+        // Track if the parent is a leader to pass that status to the child
+        let mut parent_is_leader = Vec::new();
         for idx in 0..num_particles_for_marking {
             if self.state.divide_flags[idx] == 1 {
                 parent_indices.push(idx as u32);
+                // Check if the parent is a leader and store that information
+                if idx < self.state.is_leader.len() {
+                    parent_is_leader.push(self.state.is_leader[idx] == 1);
+                } else {
+                    parent_is_leader.push(false); // Default if out of bounds
+                }
             }
         }
 
@@ -625,7 +878,7 @@ impl CpuSimulation {
         let radius_dist_uniform = Uniform::new(min_overlap_dist_sq.sqrt(), 2.0 * min_overlap_dist_sq.sqrt())?;
 
         // --- Determine Daughter Cell Placements Serially (Read Phase) ---
-        let mut new_daughters_data: Vec<(f32, f32, f32)> = Vec::with_capacity(num_potential_new_cells);
+        let mut new_daughters_data: Vec<(f32, f32, f32, bool)> = Vec::with_capacity(num_potential_new_cells); // Added leader status
         let initial_num_particles = self.state.num_particles as usize; // Immutable borrow for reading current state
 
         // Use the copied parameter values
@@ -635,16 +888,10 @@ impl CpuSimulation {
         let pos_x_in_read = &self.state.positions_x_in;
         let pos_y_in_read = &self.state.positions_y_in;
 
-        for parent_idx_u32 in parent_indices {
-            let parent_idx = parent_idx_u32 as usize;
-            // Bounds check before reading parent position
-            if parent_idx >= pos_x_in_read.len() || parent_idx >= pos_y_in_read.len() {
-                warn!("Parent index {} out of bounds for position read in division. Skipping.", parent_idx);
-                continue;
-            }
-            let parent_pos_x = pos_x_in_read[parent_idx];
-            let parent_pos_y = pos_y_in_read[parent_idx];
-            let parent_pos = Vec2::new(parent_pos_x, parent_pos_y);
+        for (i, parent_idx_u32) in parent_indices.iter().enumerate() {
+            let parent_idx = *parent_idx_u32 as usize;
+            // Get parent leader status - default to false if index invalid
+            let is_parent_leader = i < parent_is_leader.len() && parent_is_leader[i];
 
             let mut placement_successful = false;
             let mut final_daughter_pos = Vec2::new(0.0, 0.0);
@@ -653,13 +900,27 @@ impl CpuSimulation {
             for _attempt in 0..MAX_PLACEMENT_ATTEMPTS {
                 let angle = rng.sample(angle_dist_uniform);
                 let radius = rng.sample(radius_dist_uniform);
+
+                if parent_idx >= pos_x_in_read.len() || parent_idx >= pos_y_in_read.len() {
+                    warn!("Parent index {} out of bounds for position read in division. Skipping.", parent_idx);
+                    continue;
+                }
+                let parent_pos_x = pos_x_in_read[parent_idx];
+                let parent_pos_y = pos_y_in_read[parent_idx];
+                let parent_pos = Vec2::new(parent_pos_x, parent_pos_y);
+        
                 let candidate = (
                     parent_pos.x + radius * angle.cos(),
                     parent_pos.y + radius * angle.sin(),
                 );
 
-                if candidate.0 >= world_width_val { continue; }
-                if candidate.1 >= world_height_val { continue; }
+                // Check if position would be too close to boundaries
+                // Use r_c (cell radius) as the minimum distance from boundaries
+                let r_c = self.state.params.r_c;
+                if candidate.0 < r_c || candidate.0 > (world_width_val - r_c) ||
+                   candidate.1 < r_c || candidate.1 > (world_height_val - r_c) {
+                    continue; // Too close to boundary, try another position
+                }
 
                 // --- Validate Candidate Position ---
                 // Check against existing particles
@@ -687,7 +948,7 @@ impl CpuSimulation {
                 }
 
                 // Check against *other potential daughters* already decided in this step
-                for (other_daughter_x, other_daughter_y, _) in &new_daughters_data {
+                for (other_daughter_x, other_daughter_y, _, _) in &new_daughters_data {
                     let other_daughter_pos = Vec2::new(*other_daughter_x, *other_daughter_y);
                     let dist_sq = (candidate.0 - other_daughter_pos.x).powi(2)
                                 + (candidate.1 - other_daughter_pos.y).powi(2);
@@ -710,6 +971,7 @@ impl CpuSimulation {
                     final_daughter_pos.x,
                     final_daughter_pos.y,
                     final_daughter_orient,
+                    is_parent_leader, // Inherit leader status
                 ));
             } else {
                 debug!(
@@ -722,8 +984,15 @@ impl CpuSimulation {
 
         // --- Add New Daughter Cells Serially (Write Phase) ---
         let actual_new_cells_count = new_daughters_data.len();
-        for (x, y, orient) in new_daughters_data {
+        for (x, y, orient, is_leader) in new_daughters_data {
             self.state.add_particle(x, y, orient);
+            // Set leader status for the new cell
+            if is_leader {
+                let new_idx = self.state.num_particles - 1; // Index of the newly added cell
+                if (new_idx as usize) < self.state.is_leader.len() {
+                    self.state.is_leader[new_idx as usize] = 1;
+                }
+            }
         }
 
         let final_total_particles = initial_num_particles as u32 + actual_new_cells_count as u32;
@@ -795,7 +1064,7 @@ impl CpuSimulation {
                             count += 1;
                         }
                     } else {
-                        eprintln!("Warning: Index {} out of bounds for pos_x_slice (len {}) in calculate_cell_count_in_wound_area.", i, pos_x_slice.len());
+                        error!("Warning: Index {} out of bounds for pos_x_slice (len {}) in calculate_cell_count_in_wound_area.", i, pos_x_slice.len());
                     }
                 }
             }
@@ -826,7 +1095,7 @@ impl CpuSimulation {
             .map(|idx| {
                 // Bounds check before accessing slices
                 if idx >= pos_x_slice.len() || idx >= pos_y_slice.len() {
-                    eprintln!("Warning: Index {} out of bounds for position slices in calculate_neighbor_counts_parallel.", idx);
+                    error!("Warning: Index {} out of bounds for position slices in calculate_neighbor_counts_parallel.", idx);
                     return 0; // Return 0 neighbors if index is invalid
                 }
 
@@ -851,7 +1120,6 @@ impl CpuSimulation {
             })
             .collect() // Collect the results into a Vec<u32>
     }
-
 
     /// Collects all specified metrics and stores them as a Snapshot.
     /// Should be called at record intervals.
@@ -907,6 +1175,7 @@ impl CpuSimulation {
         // Debug the neighbor counts
         let mut total_neighbors = 0;
         let mut max_neighbors = 0;
+
         let counts_len = neighbor_counts_distribution.len();
         
         for &count in &particle_neighbor_counts {
@@ -917,7 +1186,7 @@ impl CpuSimulation {
                 neighbor_counts_distribution[count as usize] += 1;
             } else {
                 // If a cell has more neighbors than MAX_EXPECTED_NEIGHBORS, just count it in the last bin or ignore/warn
-                warn!("Particle has {} neighbors, exceeding MAX_EXPECTED_NEIGHBORS {}. Incrementing last bin.", 
+                debug!("Particle has {} neighbors, exceeding MAX_EXPECTED_NEIGHBORS {}. Incrementing last bin.", 
                     count, MAX_EXPECTED_NEIGHBORS - 1);
                 if !neighbor_counts_distribution.is_empty() {
                     neighbor_counts_distribution[counts_len - 1] += 1; // Add to the last bin
@@ -932,7 +1201,7 @@ impl CpuSimulation {
             0.0
         };
         
-        info!(
+        debug!(
             "Neighbor stats: total_particles={}, avg_neighbors={:.2}, max_neighbors={}",
             particle_neighbor_counts.len(), avg_neighbors, max_neighbors
         );
@@ -955,8 +1224,35 @@ impl CpuSimulation {
             positions: positions_snapshot, // Add the positions field
         };
 
-        // Store the snapshot
+        // Handle incremental writes if enabled
+        match &mut self.snapshot_writer {
+            SnapshotWriter::Bincode(writer_mutex) => {
+                match writer_mutex.lock() {
+                    Ok(mut writer) => {
+                        match bincode::serialize_into(&mut *writer, &snapshot) {
+                            Ok(_) => {
+                                self.snapshot_count += 1;
+                                debug!("Successfully wrote snapshot {} incremental (t={:.2})", self.snapshot_count, current_sim_time);
+                                // Don't need to store in memory if we're writing incrementally
+                            },
+                            Err(e) => {
+                                error!("Failed to write incremental snapshot: {}", e);
+                                // Fall back to in-memory storage
+                                self.recorded_snapshots.push(snapshot.clone());
+                            }
+                        }
+                    },
+                    Err(e) => {
+                        error!("Failed to acquire lock for snapshot writer: {}", e);
+                        self.recorded_snapshots.push(snapshot.clone());
+                    }
+                }
+            },
+            SnapshotWriter::None => {
+                // Traditional in-memory storage
         self.recorded_snapshots.push(snapshot);
+}
+        }
 
         Ok(())
     }
@@ -964,6 +1260,39 @@ impl CpuSimulation {
     /// Provides access to the recorded snapshots.
     pub fn get_recorded_snapshots(&self) -> &Vec<Snapshot> {
         &self.recorded_snapshots
+    }
+
+    pub fn finalize_snapshot_writer(&mut self) -> Result<()> {
+        match &mut self.snapshot_writer {
+            SnapshotWriter::Bincode(writer_mutex) => {
+                if let Ok(mut writer) = writer_mutex.lock() {
+                    // Flush any pending writes
+                    if let Err(e) = writer.flush() {
+                        error!("Error flushing snapshot writer: {}", e);
+                        return Err(anyhow::anyhow!("Failed to flush snapshot writer"));
+                    }
+                    
+                    // Get the underlying file and seek to beginning
+                    let file = writer.get_mut();
+                    if let Err(e) = file.seek(std::io::SeekFrom::Start(0)) {
+                        error!("Error seeking to beginning of file: {}", e);
+                        return Err(anyhow::anyhow!("Failed to seek in snapshot file"));
+                    }
+                    
+                    // Write the actual snapshot count
+                    if let Err(e) = bincode::serialize_into(&mut *file, &self.snapshot_count) {
+                        error!("Error writing final snapshot count: {}", e);
+                        return Err(anyhow::anyhow!("Failed to write snapshot count"));
+                    }
+                    
+                    info!("Finalized snapshot file with {} snapshots", self.snapshot_count);
+                    Ok(())
+                } else {
+                    Err(anyhow::anyhow!("Failed to acquire lock for snapshot writer"))
+                }
+            },
+            SnapshotWriter::None => Ok(()),
+        }
     }
 
     /// Updates the `is_leader` flags based on proximity to the wound edge.
@@ -974,57 +1303,91 @@ impl CpuSimulation {
         }
         let num_particles = self.state.num_particles as usize;
         let leader_percentage = self.config.bias.leader_percentage.unwrap_or(0.0);
-        if leader_percentage <= 0.0 { return Ok(()); } // Skip if percentage is zero or less
+        
+        // Clear leader state if disabled, percentage is zero, or no particles
+        if leader_percentage <= 0.0 || num_particles == 0 {
+             self.state.is_leader.iter_mut().for_each(|flag| *flag = 0);
+             self.state.current_leader_indices.clear();
+             debug!("Leader bias disabled or no particles. Cleared leader state.");
+             return Ok(());
+        }
 
-        let num_leaders = ((num_particles as f32 * leader_percentage).round() as usize).max(1).min(num_particles); // Ensure 1 <= num_leaders <= num_particles
+        let num_leaders = ((num_particles as f32 * leader_percentage).round() as usize).max(1).min(num_particles);
 
-        // --- Determine Wound Edge (Example for straight_edge) ---
-        let wound_edge_x = match self.config.initial_conditions.wound_type.as_str() {
-            "straight_edge" => self.config.initial_conditions.wound_param1 / 1000.0,
+        // --- Calculate Distances based on Wound Type --- 
+        // Use current positions (_in buffers)
+        let pos_x_slice = &self.state.positions_x_in;
+        let distances: Vec<(u32, f32)> = match self.config.initial_conditions.wound_type.as_str() {
+            "straight_edge" => {
+                let edge_x_um = self.config.initial_conditions.wound_param1 / 1000.0;
+                (0..num_particles)
+                    .filter_map(|idx| {
+                        // Bounds check for slice access
+                        if idx < pos_x_slice.len() {
+                            let pos_x = pos_x_slice[idx];
+                            if pos_x < edge_x_um { // Only consider cells outside the wound (left side)
+                                let dist = edge_x_um - pos_x; // Distance to the single edge
+                                Some((idx as u32, dist))
+                            } else { None }
+                        } else { None }
+                    })
+                    .collect()
+            }
+            "strip" => {
+                let edge_left_um = self.config.initial_conditions.wound_param1 / 1000.0;
+                let edge_right_um = self.config.initial_conditions.wound_param2 / 1000.0;
+                // Ensure edge1 is the left edge and edge2 is the right edge of the gap
+                let (edge1, edge2) = if edge_left_um < edge_right_um { (edge_left_um, edge_right_um) } else { (edge_right_um, edge_left_um) };
+
+                (0..num_particles)
+                    .filter_map(|idx| {
+                        // Bounds check for slice access
+                        if idx < pos_x_slice.len() {
+                            let pos_x = pos_x_slice[idx];
+                            // Only consider cells outside the wound gap
+                            if pos_x < edge1 { // Cell is to the left of the gap
+                                let dist = edge1 - pos_x; // Distance to the left edge of the gap
+                                Some((idx as u32, dist))
+                            } else if pos_x > edge2 { // Cell is to the right of the gap
+                                let dist = pos_x - edge2; // Distance to the right edge of the gap
+                                Some((idx as u32, dist))
+                            } else { None } // Cell is inside the gap
+                        } else { None }
+                    })
+                    .collect()
+            }
             _ => {
                 warn!("Leader selection not implemented for wound type: '{}'. Skipping leader update.", self.config.initial_conditions.wound_type);
+                 // Clear leader state if type is unsupported
+                 self.state.is_leader.iter_mut().for_each(|flag| *flag = 0);
+                 self.state.current_leader_indices.clear();
                 return Ok(());
             }
         };
 
-        // --- Calculate Distance to Edge and Sort --- 
-        // Use current positions (_in buffers)
-        let pos_x_slice = &self.state.positions_x_in;
-        let mut distances: Vec<(u32, f32)> = (0..num_particles)
-            .filter_map(|idx| {
-                if idx < pos_x_slice.len() { // Bounds check
-                    let pos_x = pos_x_slice[idx];
-                    // Leaders are those *closest* to the wound area (smallest distance to edge_x)
-                    // For straight_edge, wound is x > wound_edge_x, so closest means smallest positive (pos_x - wound_edge_x)
-                    // We only consider cells *outside* the wound (pos_x < wound_edge_x)
-                    if pos_x < wound_edge_x {
-                         let dist = wound_edge_x - pos_x; // Distance for cells left of the edge
-                         Some((idx as u32, dist))
-                    } else {
-                        None // Ignore cells already in the wound
-                    }
-                } else {
-                    None
-                }
-            })
-            .collect();
-
         // Sort by distance (ascending - closest to edge first)
+        let mut distances = distances;
         distances.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
 
-        // --- Mark Leaders --- 
-        // Reset all flags first
+        // --- Mark Leaders and Populate Index List --- 
+        // Reset flags first
         self.state.is_leader.iter_mut().for_each(|flag| *flag = 0);
-        // Mark the top N closest as leaders
+        // Clear and reserve capacity for the leader index list
+        self.state.current_leader_indices.clear();
+        self.state.current_leader_indices.reserve(num_leaders);
+
         let mut leaders_marked = 0;
         for (leader_idx_u32, _dist) in distances.iter().take(num_leaders) {
             let leader_idx = *leader_idx_u32 as usize;
-            if leader_idx < self.state.is_leader.len() { // Bounds check
+            if leader_idx < self.state.is_leader.len() { // Bounds check before marking
                  self.state.is_leader[leader_idx] = 1;
+                 self.state.current_leader_indices.push(*leader_idx_u32); // Add to the cached list
                  leaders_marked += 1;
+            } else {
+                warn!("Leader index {} out of bounds during marking. Skipping.", leader_idx);
             }
         }
-        debug!("Updated leaders: {} cells marked (target: {}).", leaders_marked, num_leaders);
+        debug!("Updated leaders: {} cells marked (target: {}). Leader index list size: {}", leaders_marked, num_leaders, self.state.current_leader_indices.len());
         Ok(())
     }
 
@@ -1083,4 +1446,91 @@ fn place_initial_cells(
         positions.push((px, py));
     }
     Ok(positions)
+}
+
+/// Generate a biased random angle that favors a direction toward the nearest leader.
+/// Uses a wrapped Normal distribution approximation (mean at direction to leader, with concentration parameter).
+fn generate_leader_biased_direction(
+    current_pos: Vec2,
+    leader_pos: Vec2,
+    bias_strength: f32, // Controls the strength of the bias (0.0 = uniform, higher = more concentrated)
+    rng: &mut StdRng,
+) -> Result<f32> {
+    // Calculate the angle toward the leader
+    let dir_to_leader = (leader_pos.sub(current_pos)).normalize_or_zero();
+    let target_angle = if dir_to_leader.length_squared() > 1e-12 {
+        vec_to_angle(dir_to_leader)
+    } else {
+        // If positions are identical (extremely rare), use a random angle
+        let uniform = Uniform::new(0.0f32, 2.0 * std::f32::consts::PI)?;
+        return Ok(rng.sample(uniform));
+    };
+    
+    // Apply a stronger bias effect by reducing the standard deviation
+    // The original calculation wasn't producing enough directional guidance
+    // A smaller standard deviation means more cells will move directly toward leaders
+    let bias_boost_factor = 3.0; // Boost the effective bias strength
+    
+    // Calculate standard deviation based on bias strength
+    // Higher bias_strength = lower standard deviation = more concentrated distribution
+    // We clamp it to ensure it's reasonable (neither too focused nor too uniform)
+    let std_dev = (1.0 / bias_strength.max(0.1).min(10.0)) * std::f32::consts::PI;
+    
+    // Create a normal distribution centered around the target angle
+    let normal = Normal::new(0.0f32, std_dev)?;
+    
+    // Sample from the normal distribution for deviation from target angle
+    let angle_deviation = normal.sample(rng);
+    
+    // Apply the deviation to the target angle and wrap to [0, 2π)
+    let mut angle = target_angle + angle_deviation;
+    
+    // Ensure the angle is within [0, 2π)
+    while angle < 0.0 {
+        angle += 2.0 * std::f32::consts::PI;
+    }
+    while angle >= 2.0 * std::f32::consts::PI {
+        angle -= 2.0 * std::f32::consts::PI;
+    }
+    
+    Ok(angle)
+}
+
+/// Calculate a consistent density gradient bias vector using the reference gradients.
+/// This ensures consistent directional bias throughout the simulation.
+fn calculate_consistent_density_gradient_bias(
+    position: Vec2, 
+    params: &SimParams,
+    reference_gradient_x: &[f32],
+    reference_gradient_y: &[f32],
+) -> Vec2 {
+    // Get the grid cell index for the current position
+    let grid_idx = get_grid_cell_idx(position, params) as usize;
+    
+    // Safely get gradient components from reference gradients, default to zero if out of bounds
+    let gradient_x = if grid_idx < reference_gradient_x.len() { 
+        -reference_gradient_x[grid_idx] 
+    } else { 
+        0.0 
+    };
+    
+    let gradient_y = if grid_idx < reference_gradient_y.len() { 
+        -reference_gradient_y[grid_idx] 
+    } else { 
+        0.0 
+    };
+
+    // Create a gradient vector (negative gradient points from high to low density)
+    let gradient_vec = Vec2::new(gradient_x, gradient_y);
+    
+    // Apply a multiplier to increase the gradient significance
+    // This compensates for normalization that happens when vectors are combined
+    let gradient_multiplier = 3.0;
+    let boosted_gradient = gradient_vec.scale(gradient_multiplier);
+    
+    if boosted_gradient.length_squared() > 1e-12 {
+        boosted_gradient
+    } else {
+        Vec2::zero() // No bias if gradient is too small
+    }
 }
