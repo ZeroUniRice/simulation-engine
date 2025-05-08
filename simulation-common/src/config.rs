@@ -40,6 +40,13 @@ pub struct CellParamsConfig {
     pub max_division_rate_per_hr: f32,
     pub coeff_scatter: f32,
     pub density_bias_strength: f32,
+    // Physics collision parameters
+    #[serde(default = "default_restitution")]
+    pub restitution: f32,
+    #[serde(default = "default_friction")]
+    pub friction: f32,
+    #[serde(default = "default_inertia_factor")]
+    pub inertia_factor: f32,
 }
 
 // Configuration for output settings, loaded from config.toml
@@ -222,6 +229,10 @@ impl SimulationConfig {
             d_max_per_dt,
             c_s: coeff_scatter,
             density_bias_strength,
+            // Physics-based collision parameters
+            restitution: self.cell_params.restitution,
+            friction: self.cell_params.friction,
+            inertia_factor: self.cell_params.inertia_factor,
             // Bias Parameters
             primary_bias_type: primary_bias_type_u8,
             leader_bias_strength: self.bias.leader_bias_strength.unwrap_or(0.0),
@@ -232,4 +243,17 @@ impl SimulationConfig {
             adhesion_strength: self.bias.adhesion_strength.unwrap_or(0.0),
         }
     }
+}
+
+// Default functions for physics parameters
+fn default_restitution() -> f32 {
+    0.5 // Medium elasticity - 0.0 is perfectly inelastic, 1.0 is perfectly elastic
+}
+
+fn default_friction() -> f32 {
+    0.7 // Medium friction coefficient for tangential collision components
+}
+
+fn default_inertia_factor() -> f32 {
+    5.0 // Controls acceleration rate to target velocity
 }

@@ -13,7 +13,7 @@ use openh264::formats::YUVBuffer;
 use palette::{Hsv, Srgb, FromColor};
 use rayon::prelude::*;
 use ab_glyph::{Font, FontRef, PxScale, Point};
-use simulation_common::{Snapshot, SimulationConfig};
+use simulation_common::{PrimaryBiasType, SimulationConfig, Snapshot};
 use std::fs::{self, File};
 use std::io::{BufReader, Read, Seek, SeekFrom, Cursor, Write};
 use std::path::{Path, PathBuf};
@@ -333,13 +333,30 @@ fn run_with_args(args: Args) -> Result<()> {
     info!("Video FPS: {}", args.fps);
     
     // --- Determine Simulation World Dimensions ---
-    let (world_width_um, world_height_um, cell_diameter_um) =
+    let (world_width_um, world_height_um, cell_diameter_um, primary_bias, secondary_bias) =
         if let Some(config_path) = &args.config {
             match SimulationConfig::load(config_path) {
                 Ok(config) => {
                     info!("Loaded world dimensions from {}", config_path.display());
                     let params = config.get_sim_params();
-                    (params.world_width, params.world_height, params.r_c * 2.0)
+                    
+                    // Log bias types
+                    let primary_bias_type = match config.bias.primary_bias {
+                        PrimaryBiasType::None => "None",
+                        PrimaryBiasType::Leaders => "Leaders",
+                        PrimaryBiasType::DensityGradient => "Density Gradient",
+                    };
+                    
+                    let secondary_bias = if config.bias.enable_adhesion.unwrap_or(false) {
+                        "Cell Adhesion"
+                    } else {
+                        "None"
+                    };
+                    
+                    info!("Simulation uses primary bias type: {}", primary_bias_type);
+                    info!("Simulation uses secondary bias type: {}", secondary_bias);
+                    
+                    (params.world_width, params.world_height, params.r_c * 2.0, primary_bias_type, secondary_bias)
                 }
                 Err(e) => {
                     warn!(
@@ -347,18 +364,21 @@ fn run_with_args(args: Args) -> Result<()> {
                         config_path.display(),
                         e
                     );
-                    (args.world_width_um, args.world_height_um, args.cell_diameter_um)
+                    (args.world_width_um, args.world_height_um, args.cell_diameter_um, "Unknown", "Unknown")
                 }
             }
         } else {
             info!("Using provided world dimensions.");
-            (args.world_width_um, args.world_height_um, args.cell_diameter_um)
+            (args.world_width_um, args.world_height_um, args.cell_diameter_um, "Unknown", "Unknown")
         };
     
     let cell_radius_um = cell_diameter_um / 2.0;
     
     info!("Simulation world size: {:.1} um x {:.1} um", world_width_um, world_height_um);
     info!("Cell diameter for drawing: {:.1} um", cell_diameter_um);
+    if primary_bias != "Unknown" {
+        info!("Bias configuration: Primary={}, Secondary={}", primary_bias, secondary_bias);
+    }
     
     // --- Calculate Output Dimensions and Scale ---
     let output_width_px = args.width;

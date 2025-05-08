@@ -14,12 +14,18 @@ pub struct CpuState {
     pub positions_y_in: Vec<f32>,
     // Orientations (current step's input)
     pub orientations_in: Vec<f32>,
+    // Velocities (current step's input) - for momentum-based collisions
+    pub velocities_x_in: Vec<f32>,
+    pub velocities_y_in: Vec<f32>,
 
     // Positions (next step's input, current step's output)
     pub positions_x_out: Vec<f32>,
     pub positions_y_out: Vec<f32>,
     // Orientations (next step's input, current step's output)
     pub orientations_out: Vec<f32>,
+    // Velocities (next step's input, current step's output) - for momentum-based collisions
+    pub velocities_x_out: Vec<f32>,
+    pub velocities_y_out: Vec<f32>,
 
     // --- Grid-related Data (updated serially or with atomics) ---
     // Grid cell index for each particle
@@ -72,12 +78,22 @@ impl CpuState {
         let mut positions_x_in = vec![0.0; initial_capacity_usize];
         let mut positions_y_in = vec![0.0; initial_capacity_usize];
         let mut orientations_in = vec![0.0; initial_capacity_usize];
+        let mut velocities_x_in = vec![0.0; initial_capacity_usize];
+        let mut velocities_y_in = vec![0.0; initial_capacity_usize];
 
         // Copy initial data into the beginning of the _in buffers.
         if num_initial > 0 {
             positions_x_in[..num_initial].copy_from_slice(initial_pos_x);
             positions_y_in[..num_initial].copy_from_slice(initial_pos_y);
             orientations_in[..num_initial].copy_from_slice(initial_orient);
+            
+            // Initialize velocities based on orientations
+            let default_speed = params.s;
+            for i in 0..num_initial {
+                let direction = simulation_common::angle_to_vec(initial_orient[i]);
+                velocities_x_in[i] = direction.x * default_speed;
+                velocities_y_in[i] = direction.y * default_speed;
+            }
         }
 
         Ok(Self {
@@ -89,10 +105,14 @@ impl CpuState {
             positions_x_in,
             positions_y_in,
             orientations_in,
+            velocities_x_in,
+            velocities_y_in,
 
             positions_x_out: vec![0.0; initial_capacity_usize],
             positions_y_out: vec![0.0; initial_capacity_usize],
             orientations_out: vec![0.0; initial_capacity_usize],
+            velocities_x_out: vec![0.0; initial_capacity_usize],
+            velocities_y_out: vec![0.0; initial_capacity_usize],
 
             particle_grid_indices: vec![0; initial_capacity_usize],
             cell_counts: vec![0; num_grid_cells], // Length depends on grid size
@@ -114,6 +134,8 @@ impl CpuState {
         std::mem::swap(&mut self.positions_x_in, &mut self.positions_x_out);
         std::mem::swap(&mut self.positions_y_in, &mut self.positions_y_out);
         std::mem::swap(&mut self.orientations_in, &mut self.orientations_out);
+        std::mem::swap(&mut self.velocities_x_in, &mut self.velocities_x_out);
+        std::mem::swap(&mut self.velocities_y_in, &mut self.velocities_y_out);
         // Clear the new output buffers (which were the old input buffers)
         // This isn't strictly necessary if we always write to the full num_particles range,
         // but can prevent using stale data if num_particles decreases (not currently possible).
@@ -140,9 +162,13 @@ impl CpuState {
             self.positions_x_in.resize(new_capacity_usize, 0.0);
             self.positions_y_in.resize(new_capacity_usize, 0.0);
             self.orientations_in.resize(new_capacity_usize, 0.0);
+            self.velocities_x_in.resize(new_capacity_usize, 0.0);
+            self.velocities_y_in.resize(new_capacity_usize, 0.0);
             self.positions_x_out.resize(new_capacity_usize, 0.0);
             self.positions_y_out.resize(new_capacity_usize, 0.0);
             self.orientations_out.resize(new_capacity_usize, 0.0);
+            self.velocities_x_out.resize(new_capacity_usize, 0.0);
+            self.velocities_y_out.resize(new_capacity_usize, 0.0);
 
             self.particle_grid_indices.resize(new_capacity_usize, 0);
             self.cell_particle_indices.resize(new_capacity_usize, 0);
@@ -170,6 +196,12 @@ impl CpuState {
             self.positions_x_in[idx] = x;
             self.positions_y_in[idx] = y;
             self.orientations_in[idx] = orientation;
+            
+            // Initialize velocities based on orientation (using default speed)
+            let default_speed = self.params.s; // Use the default speed parameter
+            let direction = simulation_common::angle_to_vec(orientation);
+            self.velocities_x_in[idx] = direction.x * default_speed;
+            self.velocities_y_in[idx] = direction.y * default_speed;
 
             // Initialize other per-particle state at this index.
             self.divide_flags[idx] = 0;
@@ -180,6 +212,8 @@ impl CpuState {
             self.positions_x_out[idx] = 0.0; // Initialize corresponding _out slot
             self.positions_y_out[idx] = 0.0;
             self.orientations_out[idx] = 0.0;
+            self.velocities_x_out[idx] = 0.0; // Initialize velocity outputs
+            self.velocities_y_out[idx] = 0.0;
             self.particle_grid_indices[idx] = 0; // Initialize grid index
             // cell_particle_indices is fully rebuilt, no need to initialize here.
 

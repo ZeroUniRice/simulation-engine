@@ -29,6 +29,11 @@ pub struct SimParams {
     pub d_max_per_dt: f32, // Max division probability per timestep
     pub c_s: f32, // Coefficient of scatter (probability of ideal collision)
     pub density_bias_strength: f32, // Strength of density gradient bias
+    
+    // Physics-based collision parameters
+    pub restitution: f32, // Coefficient of restitution (elasticity) for collisions
+    pub friction: f32, // Friction coefficient for tangential collision components
+    pub inertia_factor: f32, // Controls how quickly cells accelerate to target velocity (higher = faster)
 
     // Bias Parameters
     pub primary_bias_type: u8, // 0: None, 1: Leaders, 2: DensityGradient
