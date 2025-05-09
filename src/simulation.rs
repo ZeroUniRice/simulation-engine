@@ -235,7 +235,7 @@ impl CpuSimulation {
                 debug!("Cached maximum density: {}", self.cached_max_density);
                 
                 debug!("Pre-computing grid cell gradient vectors");
-                self.precompute_all_gradient_vectors(); // This will now use cached_max_density
+                self.precompute_all_gradient_vectors(); 
             }
         }
 
@@ -427,9 +427,6 @@ impl CpuSimulation {
         let params = &self.state.params;
         let time_step = self.current_time_step;
 
-        let unit_dist = Uniform::new(0.0f32, 1.0f32)?;
-        let rand_angle_dist = Uniform::new(0.0f32, 2.0 * std::f32::consts::PI)?;
-
         let pos_x_in_slice = &self.state.positions_x_in;
         let pos_y_in_slice = &self.state.positions_y_in;
         let orientations_in_slice = &self.state.orientations_in;
@@ -453,17 +450,18 @@ impl CpuSimulation {
         let velocities: Vec<(Vec2, f32)> = (0..num_particles)
             .into_par_iter()
             .map(|idx| {
-                let thread_rng_seed = self.config.initial_conditions.initial_placement_seed
-                    .wrapping_add(idx as u64)
-                    .wrapping_add(time_step as u64);
-                let mut rng = StdRng::seed_from_u64(thread_rng_seed);
+                // Create distributions inside the parallel task for full isolation
+                let unit_dist_thread = Uniform::new(0.0f32, 1.0f32).expect("Failed to create thread-local unit_dist");
+                let rand_angle_dist_thread = Uniform::new(0.0f32, 2.0 * std::f32::consts::PI).expect("Failed to create thread-local rand_angle_dist");
+
+                let mut rng = StdRng::from_os_rng();
                 
                 let current_pos = Vec2::new(pos_x_in_slice[idx], pos_y_in_slice[idx]);
                 let current_theta = orientations_in_slice[idx];
                 let current_vel = Vec2::new(vel_x_in_slice[idx], vel_y_in_slice[idx]);
                 
                 let p_change: f32 = 1.0 - (-params.dt * params.inv_p).exp();
-                let mut desired_dir = angle_to_vec(current_theta);
+                let mut desired_dir = angle_to_vec(current_theta); // Default to current direction if persistence holds
                 let mut bias_vec = Vec2::zero();
                 
                 if params.primary_bias_type == 1 && is_leader_slice[idx] == 0 { 
@@ -473,7 +471,7 @@ impl CpuSimulation {
                         let leader_idx = leader_idx_u32 as usize;
                         if leader_idx < num_particles && leader_idx != idx {
                             if leader_idx < pos_x_in_slice.len() && leader_idx < pos_y_in_slice.len() {
-                                let leader_pos = Vec2::new(pos_x_in_slice[leader_idx], pos_y_in_slice[leader_idx]);
+                                let leader_pos = Vec2::new(pos_x_in_slice[leader_idx], pos_y_in_slice[leader_idx]); // CORRECTED
                                 let dist_sq = current_pos.distance_squared(leader_pos);
                                 if dist_sq < min_dist_sq {
                                     min_dist_sq = dist_sq;
@@ -505,28 +503,57 @@ impl CpuSimulation {
                     bias_vec = bias_vec.add(gradient_bias_val);
                 }
                 
-                if params.enable_adhesion && rng.sample(unit_dist) < params.adhesion_probability {
+                if params.enable_adhesion && rng.sample(unit_dist_thread) < params.adhesion_probability { // MODIFIED: use unit_dist_thread
                     // Placeholder for adhesion
                 }
                 
-                if rng.sample(unit_dist) < p_change {
-                    if bias_vec.length_squared() > 1e-12 {
-                        let blend_factor = 0.7; 
-                        let combined = desired_dir.scale(blend_factor).add(bias_vec.scale(1.0 - blend_factor));
-                        if combined.length_squared() > 1e-12 {
-                            desired_dir = combined.normalize_or_zero();
+                // --- Determine desired_dir based on persistence and bias ---
+                if rng.sample(unit_dist_thread) < p_change { // Persistence is lost
+                    if bias_vec.length_squared() > 1e-12 { // Bias exists
+                        let ideal_dir_vec = bias_vec.normalize_or_zero();
+                        
+                        // Use params.c_s (coeff_scatter) to determine angular deviation
+                        // params.c_s = 1.0 means ideal direction, 0.0 means max scatter.
+                        // Ensure c_s is clamped between 0.0 and 1.0 for safety.
+                        let scatter_factor = params.c_s.max(0.0).min(1.0);
+
+                        if scatter_factor >= 0.9999 { // If c_s is effectively 1.0, use ideal direction
+                            desired_dir = ideal_dir_vec;
+                        } else {
+                            let target_angle = vec_to_angle(ideal_dir_vec);
+                            
+                            // Standard deviation scales inversely with scatter_factor.
+                            // Max angular spread (when scatter_factor = 0) is PI/2 radians (90 degrees).
+                            let max_angular_spread_rad = std::f32::consts::PI / 2.0; 
+                            let std_dev = (1.0 - scatter_factor) * max_angular_spread_rad;
+
+                            if std_dev < 1e-6 { // If std_dev is effectively zero
+                                desired_dir = ideal_dir_vec;
+                            } else {
+                                match Normal::new(0.0f32, std_dev) {
+                                    Ok(normal_dist) => {
+                                        let angle_deviation = normal_dist.sample(&mut rng);
+                                        let new_biased_angle = target_angle + angle_deviation;
+                                        // Normalize angle to [0, 2*PI)
+                                        desired_dir = angle_to_vec(new_biased_angle.rem_euclid(2.0 * std::f32::consts::PI));
+                                    }
+                                    Err(_e) => {
+                                        // Fallback if Normal distribution fails (e.g., std_dev is too small or invalid)
+                                        // Log this event if it's unexpected in practice.
+                                        // trace!(\"Normal distribution creation failed for scatter: {}\", _e);
+                                        desired_dir = ideal_dir_vec; // Default to ideal direction on error
+                                    }
+                                }
+                            }
                         }
-                    } else {
-                        let random_angle = rng.sample(rand_angle_dist);
+                    } else { // No bias, or bias vector is effectively zero
+                        // New direction is random
+                        let random_angle = rng.sample(rand_angle_dist_thread);
                         desired_dir = angle_to_vec(random_angle);
                     }
-                } else if bias_vec.length_squared() > 1e-12 {
-                    let weak_bias_factor = 0.3;
-                    let combined = desired_dir.scale(1.0 - weak_bias_factor).add(bias_vec.scale(weak_bias_factor));
-                    if combined.length_squared() > 1e-12 {
-                        desired_dir = combined.normalize_or_zero();
-                    }
                 }
+                // else: Persistence is NOT lost.
+                // desired_dir (initialized from current_theta) remains unchanged by bias.
                 
                 let target_speed = params.s;
                 let target_velocity = desired_dir.scale(target_speed);
@@ -556,6 +583,9 @@ impl CpuSimulation {
                     .wrapping_add(idx as u64)
                     .wrapping_add((time_step as u64).wrapping_mul(0x51A3));
                 let mut rng = StdRng::seed_from_u64(thread_rng_seed);
+                // Create rand_angle_dist for this parallel loop as well, if needed for jitter
+                let rand_angle_dist_collision_jitter = Uniform::new(0.0f32, 2.0 * std::f32::consts::PI).expect("Failed to create collision jitter rand_angle_dist");
+
 
                 let current_pos = Vec2::new(pos_x_in_slice[idx], pos_y_in_slice[idx]);
                 let (velocity, theta) = velocities[idx];
@@ -580,7 +610,7 @@ impl CpuSimulation {
                         
                         let collision_vector = current_pos.sub(neighbor_pos);
                         if collision_vector.length_squared() < 1e-12 {
-                            let random_angle_val = rng.sample(rand_angle_dist); // Ensure rand_angle_dist is available or re-create
+                            let random_angle_val = rng.sample(rand_angle_dist_collision_jitter); // MODIFIED: Use thread-local dist for jitter
                             let jitter_distance = params.l_m * 0.01;
                             final_pos = current_pos.add(Vec2::new(
                                 jitter_distance * random_angle_val.cos(),
@@ -594,9 +624,11 @@ impl CpuSimulation {
                             let v1_tangent = velocity.dot(collision_tangent);
                             let v2_normal = neighbor_vel.dot(collision_normal);
                             
+
                             let v1_normal_new = ((mass - mass * restitution) * v1_normal + (1.0 + restitution) * mass * v2_normal) / (mass + mass);
                             let v1_tangent_new = v1_tangent * (1.0 - friction);
                             
+
                             final_velocity = collision_normal.scale(v1_normal_new).add(collision_tangent.scale(v1_tangent_new));
                             final_pos = current_pos.add(final_velocity.scale(params.dt));
                             
@@ -811,7 +843,7 @@ impl CpuSimulation {
                         trace!("Existing index {} out of bounds for position read in division overlap check. Skipping check.", existing_idx);
                         continue; // Skip check if index is bad
                     }
-                    let existing_pos = Vec2::new(pos_x_in_read[existing_idx], pos_y_in_read[existing_idx]);
+                    let existing_pos = Vec2::new(pos_x_in_read[existing_idx], pos_y_in_read[existing_idx]); // CORRECTED: existingIdx to existing_idx
                     let dist_sq = (candidate.0 - existing_pos.x).powi(2)
                                 + (candidate.1 - existing_pos.y).powi(2);
                     if dist_sq < min_overlap_dist_sq {
@@ -1327,7 +1359,7 @@ impl CpuSimulation {
             Some(min_val) => min_val,
             None => return Vec2::new(world_width * 0.5, world_height * 0.5), // Default to center
         };
-        
+
         let mut min_cells = Vec::new();
         for (idx, &density) in self.low_res_density_grid.iter().enumerate() {
             if (density - min_density).abs() < 1e-6 {
@@ -1363,50 +1395,48 @@ impl CpuSimulation {
     }
 
     /// Pre-computes gradient vectors for each grid cell for fast lookups during physics updates
-    fn precompute_all_gradient_vectors(&mut self) {
+    fn precompute_all_gradient_vectors(
+        &mut self,
+    ) {
         let num_grid_cells_usize = self.state.params.num_grid_cells as usize;
         let grid_dim_x = self.state.params.grid_dim_x as usize;
-        // let grid_dim_y = self.state.params.grid_dim_y as usize; // Not directly needed with enumerate
 
-        // Ensure cache vectors are correctly sized (should be by constructor)
-        // If not, this operation might panic or be incorrect.
-        // For safety, one might re-check and resize here if dynamic grid changes were possible,
-        // but assuming fixed grid size post-init.
+        // Make copies of all the values we need to avoid borrowing self inside the closure
+        let sim_params = self.state.params.clone();
+        let cell_dens = self.state.cell_density.clone();
+        // let lowest_dens_pt = self.cached_lowest_density_point; // No longer needed
+        let max_dens = self.cached_max_density;
 
-        let sim_params = &self.state.params; // Avoid repeated borrow of self.state.params
-        let ref_grad_x = &self.reference_density_gradient_x;
-        let ref_grad_y = &self.reference_density_gradient_y;
-        let cell_dens = &self.state.cell_density;
-        let lowest_dens_pt = self.cached_lowest_density_point;
-        let max_dens = self.cached_max_density; // Use the already cached max_density
+        let density_gradient_x: Vec<f32> = self.state.density_gradient_x.to_vec();
+        let density_gradient_y: Vec<f32> = self.state.density_gradient_y.to_vec();
 
         self.cached_gradient_vectors_x[..num_grid_cells_usize]
             .par_iter_mut()
             .zip(self.cached_gradient_vectors_y[..num_grid_cells_usize].par_iter_mut())
             .enumerate()
             .for_each(|(grid_idx, (grad_x_out, grad_y_out))| {
-                let current_grid_x = grid_idx % grid_dim_x;
-                let current_grid_y = grid_idx / grid_dim_x;
+                let current_grid_x_coord = grid_idx % grid_dim_x;
+                let current_grid_y_coord = grid_idx / grid_dim_x;
 
                 let cell_size = sim_params.grid_cell_size;
-                let pos_x = (current_grid_x as f32 + 0.5) * cell_size;
-                let pos_y = (current_grid_y as f32 + 0.5) * cell_size;
+                let pos_x = (current_grid_x_coord as f32 + 0.5) * cell_size;
+                let pos_y = (current_grid_y_coord as f32 + 0.5) * cell_size;
                 let position = Vec2::new(pos_x, pos_y);
 
                 let gradient = calculate_improved_density_gradient_bias(
                     position,
-                    sim_params,
-                    ref_grad_x,
-                    ref_grad_y,
-                    cell_dens,
-                    lowest_dens_pt,
-                    max_dens, // Pass cached_max_density
+                    &sim_params,
+                    &density_gradient_x,
+                    &density_gradient_y,
+                    &cell_dens,
+                    // lowest_dens_pt, // No longer needed
+                    max_dens,
                 );
                 *grad_x_out = gradient.x;
                 *grad_y_out = gradient.y;
             });
         
-        debug!("Pre-computed gradient vectors for {} grid cells", num_grid_cells_usize);
+        debug!("Pre-computed gradient vectors for {} grid cells using current density gradients", num_grid_cells_usize);
     }
 }
 
@@ -1492,12 +1522,7 @@ fn generate_leader_biased_direction(
         let uniform = Uniform::new(0.0f32, 2.0 * std::f32::consts::PI)?;
         return Ok(rng.sample(uniform));
     };
-    
-    // Apply a stronger bias effect by reducing the standard deviation
-    // The original calculation wasn't producing enough directional guidance
-    // A smaller standard deviation means more cells will move directly toward leaders
-    // let bias_boost_factor = 3.0; // Boost the effective bias strength // This seems to be unused now
-    
+        
     // Calculate standard deviation based on bias strength
     // Higher bias_strength = lower standard deviation = more concentrated distribution
     // We clamp it to ensure it's reasonable (neither too focused nor too uniform)
@@ -1559,99 +1584,111 @@ fn calculate_consistent_density_gradient_bias(
 }
 
 /// Calculate a multi-scale density gradient bias vector.
-/// This combines local and global density information to prevent cells from forming walls.
+/// Now uses current_density_gradient_x/y for its local component and bilinear interpolation for global bias.
 fn calculate_improved_density_gradient_bias(
     position: Vec2, 
     params: &SimParams,
-    reference_gradient_x: &[f32], // Fixed initial local gradient X
-    reference_gradient_y: &[f32], // Fixed initial local gradient Y
-    cell_density: &[f32],        // Current high-resolution cell density field
-    cached_lowest_density_point: Vec2,
-    cached_max_density: f32,     // Pass pre-calculated max density
+    current_density_gradient_x: &[f32], 
+    current_density_gradient_y: &[f32], 
+    cell_density: &[f32],
+    // cached_lowest_density_point: Vec2, // No longer used
+    cached_max_density: f32,
 ) -> Vec2 {
     let grid_idx = get_grid_cell_idx(position, params) as usize;
     let grid_dim_x = params.grid_dim_x as usize;
     let grid_dim_y = params.grid_dim_y as usize;
     let total_cells = grid_dim_x * grid_dim_y;
     
-    if grid_idx >= total_cells { // Basic bounds check for grid_idx itself
-        return Vec2::zero();
+    if grid_idx >= total_cells && !(position.x == params.world_width && position.y == params.world_height) { // Allow exact corner for precomputation
+        // If position is exactly at the world corner during precomputation, grid_idx might be total_cells.
+        // This is okay if we handle it in the gradient fetching.
+        // Otherwise, if it's truly out of bounds, return zero.
+        if grid_idx >= total_cells {
+             trace!("Position {:?} gives grid_idx {} which is out of bounds (total_cells {}). Returning zero bias.", position, grid_idx, total_cells);
+            return Vec2::zero();
+        }
     }
-    // Further checks for slice lengths; assume they are correctly sized up to total_cells if used
-    // e.g. reference_gradient_x.len() >= total_cells, etc.
-    // The caller (precompute_all_gradient_vectors) iterates up to num_grid_cells, so idx should be fine.
 
-    // 1. LOCAL GRADIENT - Based on the fixed reference (initial) gradient
-    let local_grad_x = if grid_idx < reference_gradient_x.len() { -reference_gradient_x[grid_idx] } else { 0.0 };
-    let local_grad_y = if grid_idx < reference_gradient_y.len() { -reference_gradient_y[grid_idx] } else { 0.0 };
+    // 1. LOCAL GRADIENT - Based on the CURRENT density gradient from self.state
+    let local_grad_x = if grid_idx < current_density_gradient_x.len() { -current_density_gradient_x[grid_idx] } else { 0.0 };
+    let local_grad_y = if grid_idx < current_density_gradient_y.len() { -current_density_gradient_y[grid_idx] } else { 0.0 };
     let local_gradient = Vec2::new(local_grad_x, local_grad_y);
     
-    // 2. MEDIUM-RANGE GRADIENT - Larger stencil (5x5 grid area) on current density
-    let current_grid_x = (grid_idx % grid_dim_x) as i32;
-    let current_grid_y = (grid_idx / grid_dim_x) as i32;
+    // 2. MEDIUM-RANGE GRADIENT - Larger stencil on current density
+    let current_grid_x_idx = (grid_idx % grid_dim_x) as i32; 
+    let current_grid_y_idx = (grid_idx / grid_dim_x) as i32; 
     let stencil_size = 2; 
     
     let mut med_grad_x = 0.0;
     let mut med_grad_y = 0.0;
     
-    let east_idx_g = (current_grid_x + stencil_size).clamp(0, grid_dim_x as i32 - 1);
-    let west_idx_g = (current_grid_x - stencil_size).clamp(0, grid_dim_x as i32 - 1);
-    let north_idx_g = (current_grid_y + stencil_size).clamp(0, grid_dim_y as i32 - 1);
-    let south_idx_g = (current_grid_y - stencil_size).clamp(0, grid_dim_y as i32 - 1);
+    let east_idx_g = (current_grid_x_idx + stencil_size).clamp(0, grid_dim_x as i32 - 1);
+    let west_idx_g = (current_grid_x_idx - stencil_size).clamp(0, grid_dim_x as i32 - 1);
+    let north_idx_g = (current_grid_y_idx + stencil_size).clamp(0, grid_dim_y as i32 - 1);
+    let south_idx_g = (current_grid_y_idx - stencil_size).clamp(0, grid_dim_y as i32 - 1);
 
-    let east_density = get_density_at(east_idx_g as usize, current_grid_y as usize, grid_dim_x, cell_density);
-    let west_density = get_density_at(west_idx_g as usize, current_grid_y as usize, grid_dim_x, cell_density);
-    // If stencil points are the same (at boundary), difference is 0
-    if east_idx_g != west_idx_g { // Avoid division by zero if stencil collapses
+    let east_density = get_density_at(east_idx_g as usize, current_grid_y_idx as usize, grid_dim_x, cell_density);
+    let west_density = get_density_at(west_idx_g as usize, current_grid_y_idx as usize, grid_dim_x, cell_density);
+    if east_idx_g != west_idx_g {
          med_grad_x = (east_density - west_density) / ((east_idx_g - west_idx_g) as f32 * params.grid_cell_size);
     }
 
-
-    let north_density = get_density_at(current_grid_x as usize, north_idx_g as usize, grid_dim_x, cell_density);
-    let south_density = get_density_at(current_grid_x as usize, south_idx_g as usize, grid_dim_x, cell_density);
-    if north_idx_g != south_idx_g { // Avoid division by zero if stencil collapses
-        med_grad_y = (north_density - south_density) / ((north_idx_g - south_idx_g) as f32 * params.grid_cell_size);
+    let north_density = get_density_at(current_grid_x_idx as usize, north_idx_g as usize, grid_dim_x, cell_density);
+    let south_density = get_density_at(current_grid_x_idx as usize, south_idx_g as usize, grid_dim_x, cell_density);
+    if north_idx_g != south_idx_g {
+               med_grad_y = (north_density - south_density) / ((north_idx_g - south_idx_g) as f32 * params.grid_cell_size);
     }
     
-    // Negative sign because gradient points towards increasing density, we want to move away from high density.
     let medium_gradient = Vec2::new(-med_grad_x, -med_grad_y); 
     
-    // 3. GLOBAL MINIMUM DENSITY DIRECTION - Use cached lowest density point
-    let to_lowest_density = cached_lowest_density_point.sub(position);
-    let global_direction = to_lowest_density.normalize_or_zero();
+    // 3. GLOBAL GRADIENT - Bilinear interpolation of density gradients
+    let particle_grid_x_float = position.x * params.inv_grid_cell_size;
+    let particle_grid_y_float = position.y * params.inv_grid_cell_size;
+
+    let x0 = (particle_grid_x_float - 0.5).floor() as i32;
+    let y0 = (particle_grid_y_float - 0.5).floor() as i32;
+    
+    let frac_x = (particle_grid_x_float - 0.5) - x0 as f32;
+    let frac_y = (particle_grid_y_float - 0.5) - y0 as f32;
+
+    let g00 = get_clamped_gradient_vec(x0, y0, grid_dim_x, grid_dim_y, current_density_gradient_x, current_density_gradient_y);
+    let g10 = get_clamped_gradient_vec(x0 + 1, y0, grid_dim_x, grid_dim_y, current_density_gradient_x, current_density_gradient_y);
+    let g01 = get_clamped_gradient_vec(x0, y0 + 1, grid_dim_x, grid_dim_y, current_density_gradient_x, current_density_gradient_y);
+    let g11 = get_clamped_gradient_vec(x0 + 1, y0 + 1, grid_dim_x, grid_dim_y, current_density_gradient_x, current_density_gradient_y);
+
+    let grad_x_interp_bottom = (1.0 - frac_x) * g00.x + frac_x * g10.x;
+    let grad_x_interp_top = (1.0 - frac_x) * g01.x + frac_x * g11.x;
+    let interpolated_grad_x = (1.0 - frac_y) * grad_x_interp_bottom + frac_y * grad_x_interp_top;
+
+    let grad_y_interp_bottom = (1.0 - frac_x) * g00.y + frac_x * g10.y;
+    let grad_y_interp_top = (1.0 - frac_x) * g01.y + frac_x * g11.y;
+    let interpolated_grad_y = (1.0 - frac_y) * grad_y_interp_bottom + frac_y * grad_y_interp_top;
+    
+    let interpolated_global_gradient = Vec2::new(interpolated_grad_x, interpolated_grad_y);
+    let global_direction = interpolated_global_gradient.normalize_or_zero();
     
     let current_density_val = if grid_idx < cell_density.len() { cell_density[grid_idx] } else { 0.0 };
-    
-    // Use the passed cached_max_density
     let max_density_val = cached_max_density; 
     
     let normalized_density = if max_density_val > 1e-6 {
         (current_density_val / max_density_val).clamp(0.0, 1.0)
-    } else {
-        0.0
-    };
+    } else { 0.0 };
     
-    let distance_sq = to_lowest_density.length_squared();
-    // Normalize distance factor against a fraction of world diagonal squared for more consistent behavior
-    let world_diag_sq_frac = (params.world_width.powi(2) + params.world_height.powi(2)) * 0.01; // e.g. 10% of diagonal
-    let distance_factor = (1.0 - (-distance_sq / world_diag_sq_frac.max(1e-6)).exp()).clamp(0.0, 1.0);
-        
-    let global_strength = distance_factor * (0.3 + 0.7 * normalized_density); 
+    // Removed distance_factor, global_strength now only depends on normalized_density
+    let global_strength = 0.3 + 0.7 * normalized_density; 
     
-    let local_weight = 0.4;
-    let medium_weight = 0.3;
-    let global_weight = 0.3;
+    let local_weight = 0.2;
+    let medium_weight = 0.2;
+    let global_weight = 0.6;
     
     let mut combined_gradient = Vec2::zero();
     
     if local_gradient.length_squared() > 1e-12 {
         combined_gradient = combined_gradient.add(local_gradient.normalize_or_zero().scale(local_weight));
     }
-    
     if medium_gradient.length_squared() > 1e-12 {
         combined_gradient = combined_gradient.add(medium_gradient.normalize_or_zero().scale(medium_weight));
     }
-    
     if global_direction.length_squared() > 1e-12 {
         combined_gradient = combined_gradient.add(global_direction.scale(global_weight * global_strength));
     }
@@ -1661,6 +1698,24 @@ fn calculate_improved_density_gradient_bias(
     }
     
     combined_gradient.scale(params.density_bias_strength)
+}
+
+/// Helper function to safely get a negated gradient vector at specific grid coordinates, clamping to bounds.
+fn get_clamped_gradient_vec(
+    x: i32, 
+    y: i32, 
+    grid_dim_x: usize, 
+    grid_dim_y: usize, 
+    grad_x_field: &[f32], 
+    grad_y_field: &[f32]
+) -> Vec2 {
+    let clamped_x = x.clamp(0, grid_dim_x as i32 - 1) as usize;
+    let clamped_y = y.clamp(0, grid_dim_y as i32 - 1) as usize;
+    let idx = clamped_y * grid_dim_x + clamped_x;
+
+    let grad_x = if idx < grad_x_field.len() { -grad_x_field[idx] } else { 0.0 };
+    let grad_y = if idx < grad_y_field.len() { -grad_y_field[idx] } else { 0.0 };
+    Vec2::new(grad_x, grad_y)
 }
 
 /// Helper function to safely get density at a grid position

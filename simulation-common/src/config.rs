@@ -38,7 +38,7 @@ pub struct CellParamsConfig {
     pub division_radius_add_um: f32,
     pub sensing_radius_add_um: f32,
     pub max_division_rate_per_hr: f32,
-    pub coeff_scatter: f32,
+    pub ideal_proc: f32,
     pub density_bias_strength: f32,
     // Physics collision parameters
     #[serde(default = "default_restitution")]
@@ -168,7 +168,7 @@ impl SimulationConfig {
         let max_division_rate_per_hr = self.cell_params.max_division_rate_per_hr;
         let division_radius_add_um = self.cell_params.division_radius_add_um;
         let sensing_radius_add_um = self.cell_params.sensing_radius_add_um;
-        let coeff_scatter = self.cell_params.coeff_scatter;
+        let ideal_proc = self.cell_params.ideal_proc;
         let density_bias_strength = self.cell_params.density_bias_strength;
 
         // --- Calculate derived values ---
@@ -227,7 +227,7 @@ impl SimulationConfig {
             s,
             inv_p,
             d_max_per_dt,
-            c_s: coeff_scatter,
+            c_s: ideal_proc,
             density_bias_strength,
             // Physics-based collision parameters
             restitution: self.cell_params.restitution,

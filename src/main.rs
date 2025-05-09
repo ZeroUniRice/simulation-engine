@@ -6,7 +6,7 @@ use std::io::{Write, BufWriter};
 use log::{debug, error, info, trace, warn, LevelFilter};
 
 // Use types from the shared library
-use simulation_common::{SimulationConfig, Snapshot}; // Keep Snapshot here as it's used for type annotation
+use simulation_common::{PrimaryBiasType, SimulationConfig, Snapshot}; // Keep Snapshot here as it's used for type annotation
 
 // Keep local module imports
 mod cpu_state;
@@ -27,7 +27,7 @@ fn main() -> Result<()> {
     
     info!("Starting Simulation Engine (CPU Parallel)...");
 
-    // --- Load Configuration ---
+    // Load Configuration
     info!("Loading configuration from config.toml...");
     let config = match SimulationConfig::load("config.toml") { // Use SimulationConfig from common
         Ok(cfg) => {
@@ -41,18 +41,16 @@ fn main() -> Result<()> {
         }
     };
 
-    // --- Configure Rayon Thread Pool (Optional) ---
-    // No change needed here, already has info log
     info!("Using {} Rayon threads.", rayon::current_num_threads());
 
-    // --- Initialize Simulation (CPU) ---
+    // Initialize Simulation
     info!("Initializing simulation state on CPU...");
     let start_init = Instant::now();
-    let mut sim = match CpuSimulation::new(config.clone()) { // Clone config here if needed later
+    let mut sim = match CpuSimulation::new(config.clone()) { 
         Ok(s) => {
             let init_duration = start_init.elapsed();
             info!("CPU State Initialized with {} particles in {:.2} ms.", s.current_particle_count(), init_duration.as_secs_f64() * 1000.0);
-            debug!("Simulation Parameters: {:#?}", s.params()); // More detailed params at debug level
+            debug!("Simulation Parameters: {:#?}", s.params()); 
             s
         },
         Err(e) => {
@@ -60,6 +58,23 @@ fn main() -> Result<()> {
             anyhow::bail!("Simulation initialization failed.");
         }
     };
+    
+    // Log bias configuration details
+    let primary_bias_type = match config.bias.primary_bias {
+        PrimaryBiasType::None => "None",
+        PrimaryBiasType::Leaders => "Leaders",
+        PrimaryBiasType::DensityGradient => "Density Gradient",
+    };
+    
+    let secondary_bias = if config.bias.enable_adhesion.unwrap_or(false) {
+        "Cell Adhesion"
+    } else {
+        "None"
+    };
+    
+    info!("Simulation uses primary bias type: {}", primary_bias_type);
+    info!("Simulation uses secondary bias type: {}", secondary_bias);
+
 
     // --- Simulation Loop ---
     let params = sim.params().clone(); // Get SimParams (from common via simulation)

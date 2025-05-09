@@ -2,23 +2,29 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use dashmap::DashMap;
 use env_logger::Builder;
-use image::{ImageBuffer, Rgba, RgbaImage, EncodableLayout};
+use image::{ImageBuffer, Rgba, RgbaImage};
 use imageproc::drawing::{draw_filled_circle_mut, draw_text_mut};
 use indicatif::{ProgressBar, ProgressStyle};
-use log::{debug, error, info, warn, LevelFilter};
+use log::{error, info, warn, LevelFilter}; // Removed unused `debug`
 // Replace mp4 imports with minimp4
 use minimp4::Mp4Muxer;
 use openh264::encoder::{BitRate, Encoder, EncoderConfig, FrameRate};
 use openh264::formats::YUVBuffer;
 use palette::{Hsv, Srgb, FromColor};
 use rayon::prelude::*;
-use ab_glyph::{Font, FontRef, PxScale, Point};
+use ab_glyph::{FontRef, PxScale}; // Removed unused Font and Point
 use simulation_common::{PrimaryBiasType, SimulationConfig, Snapshot};
 use std::fs::{self, File};
-use std::io::{BufReader, Read, Seek, SeekFrom, Cursor, Write};
+use std::io::{BufReader, Read, Seek, SeekFrom, Cursor}; // Removed unused Write
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc; // Removed unused Mutex
 use std::time::Instant;
+
+// Imports for plotting
+use plotters::prelude::*;
+use plotters::style::colors; // Import standard colors
+use plotters_bitmap::BitMapBackend;
+
 
 /// Command-line arguments for the visualizer
 #[derive(Parser, Debug)]
@@ -72,6 +78,10 @@ struct Args {
     /// Chunk size for parallel processing
     #[arg(long, default_value_t = 10)]
     chunk_size: usize,
+
+    /// Generate a summary plot PNG
+    #[arg(long)]
+    plot: bool,
 }
 
 // Color definitions for named colors (RGBA format)
@@ -107,15 +117,17 @@ fn parse_color(color_name: &str) -> [u8; 4] {
 /// Generate a color palette with a specified number of colors
 fn generate_color_palette(count: usize) -> Vec<[u8; 4]> {
     let mut colors = Vec::with_capacity(count);
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::thread_rng(); // This is fine, though `rand::rngs::ThreadRng::default()` is newer
     
     use rand::Rng;
     
     for i in 0..count {
         // Use HSV color space for better distribution
         let hue = (i as f32) / (count as f32);
-        let saturation = 0.7 + rng.gen_range(-0.1..0.1);
-        let value = 0.8 + rng.gen_range(-0.1..0.1);
+        // Use gen_range with explicit type if needed, or ensure rng is correctly typed.
+        // For f32, it should be fine.
+        let saturation = 0.7 + rng.gen_range(-0.1_f32..0.1_f32);
+        let value = 0.8 + rng.gen_range(-0.1_f32..0.1_f32);
         
         // Convert HSV to RGB
         let hsv = Hsv::new(hue * 360.0, saturation, value);
@@ -313,6 +325,119 @@ fn rgb_to_yuv420(image: &RgbaImage) -> Vec<u8> {
     yuv
 }
 
+// Helper functions for plotting data ranges
+fn get_min_max_f32(data: &[f32]) -> (f32, f32) {
+    if data.is_empty() { return (0.0, 1.0); }
+    let min = data.iter().fold(f32::INFINITY, |a, &b| a.min(b));
+    let max = data.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+    (min, if (max - min).abs() < 1e-6 { max + 1.0 } else { max })
+}
+
+fn get_min_max_u32(data: &[u32]) -> (u32, u32) {
+    if data.is_empty() { return (0, 1); }
+    let min = data.iter().min().cloned().unwrap_or(0);
+    let max = data.iter().max().cloned().unwrap_or(1);
+    (min, if min == max { max + 1 } else { max })
+}
+
+
+/// Generate a summary plot of simulation data
+fn generate_summary_plot(
+    output_path: &Path,
+    times: &[f32],
+    total_particles: &[u32],
+    cells_in_wound: &[u32],
+    avg_density: &[f32],
+    avg_neighbors: &[f32],
+) -> Result<(), Box<dyn std::error::Error>> {
+    if times.is_empty() {
+        warn!("No data available for plotting.");
+        return Ok(());
+    }
+
+    let root_area = BitMapBackend::new(output_path, (1280, 960)).into_drawing_area();
+    root_area.fill(&colors::WHITE)?;
+
+    let (time_min, time_max) = get_min_max_f32(times);
+
+    let (upper_charts, lower_charts) = root_area.split_vertically(480);
+    let charts_areas = [
+        upper_charts.split_horizontally(640).0, // Top-left
+        upper_charts.split_horizontally(640).1, // Top-right
+        lower_charts.split_horizontally(640).0, // Bottom-left
+        lower_charts.split_horizontally(640).1, // Bottom-right
+    ];
+
+    // Plot 1: Total Particles vs Time
+    if !total_particles.is_empty() {
+        let (y_min, y_max) = get_min_max_u32(total_particles);
+        let mut chart = ChartBuilder::on(&charts_areas[0])
+            .caption("Total Particles vs Time", ("sans-serif", 30))
+            .margin(10)
+            .x_label_area_size(30)
+            .y_label_area_size(40)
+            .build_cartesian_2d(time_min..time_max, y_min..y_max)?;
+        chart.configure_mesh().draw()?;
+        chart.draw_series(LineSeries::new(
+            times.iter().zip(total_particles.iter()).map(|(&t, &p)| (t, p)),
+            &colors::RED,
+        ))?;
+    }
+
+    // Plot 2: Cells in Wound vs Time
+    if !cells_in_wound.is_empty() {
+        let (y_min, y_max) = get_min_max_u32(cells_in_wound);
+        let mut chart = ChartBuilder::on(&charts_areas[1])
+            .caption("Cells in Wound vs Time", ("sans-serif", 30)) // Corrected font usage
+            .margin(10)
+            .x_label_area_size(30)
+            .y_label_area_size(40)
+            .build_cartesian_2d(time_min..time_max, y_min..y_max)?;
+        chart.configure_mesh().draw()?;
+        chart.draw_series(LineSeries::new(
+            times.iter().zip(cells_in_wound.iter()).map(|(&t, &c)| (t, c)),
+            &colors::GREEN,
+        ))?;
+    }
+
+    // Plot 3: Average Density in Wound vs Time
+    if !avg_density.is_empty() {
+        let (y_min, y_max) = get_min_max_f32(avg_density);
+        let mut chart = ChartBuilder::on(&charts_areas[2])
+            .caption("Avg Density in Wound vs Time", ("sans-serif", 30)) // Corrected font usage
+            .margin(10)
+            .x_label_area_size(30)
+            .y_label_area_size(40)
+            .build_cartesian_2d(time_min..time_max, y_min..y_max)?;
+        chart.configure_mesh().draw()?;
+        chart.draw_series(LineSeries::new(
+            times.iter().zip(avg_density.iter()).map(|(&t, &d)| (t, d)),
+            &colors::BLUE,
+        ))?;
+    }
+    
+    // Plot 4: Average Neighbors vs Time
+    if !avg_neighbors.is_empty() {
+        let (y_min, y_max) = get_min_max_f32(avg_neighbors);
+        let mut chart = ChartBuilder::on(&charts_areas[3])
+            .caption("Average Neighbors vs Time", ("sans-serif", 30)) // Corrected font usage
+            .margin(10)
+            .x_label_area_size(30)
+            .y_label_area_size(40)
+            .build_cartesian_2d(time_min..time_max, y_min..y_max)?;
+        chart.configure_mesh().draw()?;
+        chart.draw_series(LineSeries::new(
+            times.iter().zip(avg_neighbors.iter()).map(|(&t, &n)| (t, n)),
+            &colors::MAGENTA,
+        ))?;
+    }
+
+    root_area.present().context("Failed to write plot to backend")?;
+    info!("Summary plot generated at {}", output_path.display());
+    Ok(())
+}
+
+
 fn main() -> Result<()> {
     // Parse command line arguments
     let args = Args::parse();
@@ -331,7 +456,17 @@ fn run_with_args(args: Args) -> Result<()> {
     info!("Output video: {}", args.output.display());
     info!("Video dimensions: {}x{}", args.width, args.height.unwrap_or(args.width));
     info!("Video FPS: {}", args.fps);
-    
+    if args.plot {
+        info!("Plot generation enabled.");
+    }
+
+    // Data collection for plotting
+    let mut plot_times: Vec<f32> = Vec::new();
+    let mut plot_total_particles: Vec<u32> = Vec::new();
+    let mut plot_cells_in_wound: Vec<u32> = Vec::new();
+    let mut plot_avg_density: Vec<f32> = Vec::new();
+    let mut plot_avg_neighbors: Vec<f32> = Vec::new();
+
     // --- Determine Simulation World Dimensions ---
     let (world_width_um, world_height_um, cell_diameter_um, primary_bias, secondary_bias) =
         if let Some(config_path) = &args.config {
@@ -464,6 +599,22 @@ fn run_with_args(args: Args) -> Result<()> {
     // Process the first snapshot to get cell count and initial frame
     let first_snapshot: Snapshot = bincode::deserialize_from(&mut reader)
         .context("Failed to read first snapshot")?;
+
+    if args.plot {
+        plot_times.push(first_snapshot.time);
+        plot_total_particles.push(first_snapshot.total_particle_count);
+        plot_cells_in_wound.push(first_snapshot.cell_count_in_wound);
+        plot_avg_density.push(first_snapshot.average_density_in_wound);
+        let num_positions = first_snapshot.positions.as_ref().map_or(0, |p| p.len());
+        if num_positions > 0 {
+            let avg_n = first_snapshot.neighbor_counts_distribution.iter().enumerate()
+                .map(|(n, &count)| (n as u32 * count) as f32)
+                .sum::<f32>() / num_positions as f32;
+            plot_avg_neighbors.push(avg_n);
+        } else {
+            plot_avg_neighbors.push(0.0);
+        }
+    }
     
     // Debug: Print details about the first snapshot
     info!("First snapshot details:");
@@ -478,36 +629,7 @@ fn run_with_args(args: Args) -> Result<()> {
           .map(|(n, &count)| format!("{} neighbors: {} cells", n, count))
           .collect::<Vec<_>>());
     info!("  Has positions: {}", first_snapshot.positions.is_some());
-    if let Some(positions) = &first_snapshot.positions {
-        info!("  Position count: {}", positions.len());
-        if !positions.is_empty() {
-            info!("  First few positions: {:?}", &positions[..positions.len().min(5)]);
-        }
-    }
-    
-    // Also read and check a few more snapshots
-    let current_pos = reader.stream_position()?;
-    for i in 1..3 {  // Check snapshots at indices 1 and 2
-        match bincode::deserialize_from::<_, Snapshot>(&mut reader) {
-            Ok(snapshot) => {
-                info!("Snapshot {} details:", i);
-                info!("  Time: {}", snapshot.time);
-                info!("  Has positions: {}", snapshot.positions.is_some());
-                if let Some(positions) = &snapshot.positions {
-                    info!("  Position count: {}", positions.len());
-                    if !positions.is_empty() {
-                        info!("  First few positions: {:?}", &positions[..positions.len().min(5)]);
-                    }
-                }
-            },
-            Err(e) => {
-                error!("Failed to read snapshot {}: {}", i, e);
-            }
-        }
-    }
-    // Go back to where we were
-    reader.seek(SeekFrom::Start(current_pos))?;
-    
+        
     // Process the first snapshot
     let first_frame = draw_frame(
         &first_snapshot, 
@@ -528,14 +650,13 @@ fn run_with_args(args: Args) -> Result<()> {
     // Append H.264 data to our buffer
     bitstream.write_vec(&mut h264_data);
     frame_count += 1;
-    progress_bar.inc(1);
 
     // Seek back to after the header for remaining snapshots
     reader.seek(SeekFrom::Start(4))?; // 4 bytes for the u32 count
 
     // Process remaining snapshots
     let mut snapshot_chunks = Vec::new();
-    let mut chunk = Vec::new();
+    let mut chunk = Vec::with_capacity(chunk_size); // Corrected this line
     let mut i = 0;
     let mut error_count = 0;
     let mut snapshots_with_positions = 0;
@@ -548,12 +669,26 @@ fn run_with_args(args: Args) -> Result<()> {
                 if snapshot.positions.is_some() && !snapshot.positions.as_ref().unwrap().is_empty() {
                     snapshots_with_positions += 1;
                 }
+
+                if args.plot {
+                    plot_times.push(snapshot.time);
+                    plot_total_particles.push(snapshot.total_particle_count);
+                    plot_cells_in_wound.push(snapshot.cell_count_in_wound);
+                    plot_avg_density.push(snapshot.average_density_in_wound);
+                    let num_positions = snapshot.positions.as_ref().map_or(0, |p| p.len());
+                    if num_positions > 0 {
+                        let avg_n = snapshot.neighbor_counts_distribution.iter().enumerate()
+                            .map(|(n, &count)| (n as u32 * count) as f32)
+                            .sum::<f32>() / num_positions as f32;
+                        plot_avg_neighbors.push(avg_n);
+                    } else {
+                        plot_avg_neighbors.push(0.0);
+                    }
+                }
                 
                 chunk.push(snapshot);
-                if chunk.len() >= chunk_size || i == snapshot_count as usize - 1 {
-                    // Process this chunk
-                    snapshot_chunks.push(chunk);
-                    chunk = Vec::with_capacity(chunk_size);
+                if chunk.len() >= chunk_size || i == (snapshot_count -1) as usize { // Corrected condition
+                    snapshot_chunks.push(std::mem::take(&mut chunk)); // Use mem::take
                 }
             }
             Err(e) => {
@@ -572,6 +707,8 @@ fn run_with_args(args: Args) -> Result<()> {
     } else {
         info!("Found {} snapshots with position data out of {} total", snapshots_with_positions, i);
     }
+
+    progress_bar.inc(1);
     
     if error_count > 0 {
         warn!("Encountered {} errors while reading snapshots. Some frames may be missing.", error_count);
@@ -675,9 +812,9 @@ fn run_with_args(args: Args) -> Result<()> {
     video_buffer.read_to_end(&mut video_bytes)?;
     
     // Write the MP4 file
-    let output_path = args.output.to_str().unwrap_or("output.mp4");
-    fs::write(output_path, &video_bytes)
-        .with_context(|| format!("Failed to write video file to {}", output_path))?;
+    let output_path_str = args.output.to_str().unwrap_or("output.mp4"); // Renamed for clarity
+    fs::write(output_path_str, &video_bytes)
+        .with_context(|| format!("Failed to write video file to {}", output_path_str))?;
     
     // Finish progress bar
     progress_bar.finish_with_message(format!("Completed processing {} frames", frame_count));
@@ -689,6 +826,21 @@ fn run_with_args(args: Args) -> Result<()> {
         frame_count as f64 / duration.as_secs_f64()
     );
     info!("Output saved to: {}", args.output.display());
+
+    // Generate plot if requested
+    if args.plot {
+        let plot_output_path = args.output.with_extension("png");
+        if let Err(e) = generate_summary_plot(
+            &plot_output_path,
+            &plot_times,
+            &plot_total_particles,
+            &plot_cells_in_wound,
+            &plot_avg_density,
+            &plot_avg_neighbors,
+        ) {
+            error!("Failed to generate summary plot: {}", e);
+        }
+    }
 
     Ok(())
 }
@@ -716,6 +868,7 @@ mod tests {
             color: String::from("palette"),
             bg_color: String::from("white"),
             chunk_size: 10,
+            plot: false, // Added plot argument
         };
 
         // Run the main function with the test args
