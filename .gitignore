@@ -2,9 +2,9 @@
 Cargo.lock
 
 # Output files
-*.mp4
+/*.mp4
 *.bin
 *.json
 *.csv
-*.png
+/*.png
 /final_videos
