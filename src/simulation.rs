@@ -548,7 +548,7 @@ impl CpuSimulation {
                         // Add the normalized adhesion influence, scaled by adhesion_strength, to the primary bias_vec.
                         // adhesion_strength acts as a weight for this component.
                         if adhesion_influence_vec.length_squared() > 1e-9 {
-                             bias_vec = bias_vec.add(adhesion_influence_vec.normalize_or_zero().scale(params.adhesion_strength));
+                            bias_vec = bias_vec.add(adhesion_influence_vec.normalize_or_zero().scale(params.adhesion_strength));
                         }
                     }
                 }
