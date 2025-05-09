@@ -13,6 +13,8 @@ use std::io::{BufWriter, Write, Seek};
 use std::sync::Mutex;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::collections::VecDeque; // Added for BFS
+use std::collections::HashSet; // Added for tracking visited/component cells
 
 pub const MAX_EXPECTED_NEIGHBORS: usize = 19;
 
@@ -193,7 +195,7 @@ impl CpuSimulation {
         if self.config.bias.primary_bias == PrimaryBiasType::Leaders {
             let interval = self.params().leader_update_interval_steps;
             if interval > 0 && self.current_time_step % interval == 0 {
-                self.update_leaders()?
+                self.update_leaders()?;
             }
         }
 
@@ -464,16 +466,16 @@ impl CpuSimulation {
                 let mut desired_dir = angle_to_vec(current_theta); // Default to current direction if persistence holds
                 let mut bias_vec = Vec2::zero();
                 
-                if params.primary_bias_type == 1 && is_leader_slice[idx] == 0 { 
+                if params.primary_bias_type == 1 && is_leader_slice[idx] == 0 { // Leader Bias for followers
                     let mut min_dist_sq = f32::MAX;
                     let mut closest_leader_pos: Option<Vec2> = None;
                     for &leader_idx_u32 in current_leader_indices_slice {
                         let leader_idx = leader_idx_u32 as usize;
-                        if leader_idx < num_particles && leader_idx != idx {
-                            if leader_idx < pos_x_in_slice.len() && leader_idx < pos_y_in_slice.len() {
-                                let leader_pos = Vec2::new(pos_x_in_slice[leader_idx], pos_y_in_slice[leader_idx]); // CORRECTED
+                        if leader_idx < num_particles && leader_idx != idx { // Ensure leader_idx is valid and not the current particle
+                            if leader_idx < pos_x_in_slice.len() && leader_idx < pos_y_in_slice.len() { // Bounds check for position slices
+                                let leader_pos = Vec2::new(pos_x_in_slice[leader_idx], pos_y_in_slice[leader_idx]); // Corrected: leaderIdx
                                 let dist_sq = current_pos.distance_squared(leader_pos);
-                                if dist_sq < min_dist_sq {
+                                if dist_sq < min_dist_sq { // Check if this leader is closer
                                     min_dist_sq = dist_sq;
                                     closest_leader_pos = Some(leader_pos);
                                 }
@@ -503,10 +505,55 @@ impl CpuSimulation {
                     bias_vec = bias_vec.add(gradient_bias_val);
                 }
                 
-                if params.enable_adhesion && rng.sample(unit_dist_thread) < params.adhesion_probability { // MODIFIED: use unit_dist_thread
-                    // Placeholder for adhesion
+                // --- Adhesion Bias Calculation ---
+                // This section calculates an additional bias component if adhesion is enabled.
+                // Adhesion attempts to align the cell's movement with that of its nearby "adhered" neighbors.
+                if params.enable_adhesion {
+                    let mut adhesion_influence_vec = Vec2::zero();
+                    let mut num_adhered_neighbors = 0;
+
+                    // Iterate over neighbors within sensing radius to check for adhesion.
+                    // The rng.sample() check is done for each potential adhesion interaction.
+                    for_each_neighbor(
+                        idx as u32,
+                        current_pos,
+                        params.r_s_sq, // Adhesion interactions occur within the sensing radius.
+                        params,
+                        pos_x_in_slice,
+                        pos_y_in_slice,
+                        cell_particle_indices_slice,
+                        cell_starts_slice,
+                        cell_counts_slice,
+                        |neighbor_idx_u32| {
+                            // Probabilistic check for forming an adhesive link with this neighbor for this timestep.
+                            if rng.sample(unit_dist_thread) < params.adhesion_probability {
+                                let neighbor_idx = neighbor_idx_u32 as usize;
+                                if neighbor_idx < num_particles { // Ensure neighbor index is valid
+                                    // Influence is based on the neighbor's current velocity vector.
+                                    // This promotes alignment of movement.
+                                    let neighbor_vel = Vec2::new(vel_x_in_slice[neighbor_idx], vel_y_in_slice[neighbor_idx]);
+                                    if neighbor_vel.length_squared() > 1e-9 { // Only consider moving neighbors
+                                        adhesion_influence_vec = adhesion_influence_vec.add(neighbor_vel.normalize_or_zero());
+                                        num_adhered_neighbors += 1;
+                                    }
+                                }
+                            }
+                            true // Continue searching for other neighbors
+                        },
+                    );
+
+                    if num_adhered_neighbors > 0 {
+                        // Average the directional influence from all adhered neighbors.
+                        adhesion_influence_vec = adhesion_influence_vec.scale(1.0 / num_adhered_neighbors as f32);
+                        // Add the normalized adhesion influence, scaled by adhesion_strength, to the primary bias_vec.
+                        // adhesion_strength acts as a weight for this component.
+                        if adhesion_influence_vec.length_squared() > 1e-9 {
+                             bias_vec = bias_vec.add(adhesion_influence_vec.normalize_or_zero().scale(params.adhesion_strength));
+                        }
+                    }
                 }
-                
+                // --- End Adhesion Bias Calculation ---
+
                 // --- Determine desired_dir based on persistence and bias ---
                 if rng.sample(unit_dist_thread) < p_change { // Persistence is lost
                     if bias_vec.length_squared() > 1e-12 { // Bias exists
@@ -605,8 +652,8 @@ impl CpuSimulation {
                     let neighbor_idx = neighbor_idx_u32 as usize;
                     // Ensure neighbor_idx is valid before accessing its properties
                     if neighbor_idx < num_particles {
-                        let neighbor_pos = Vec2::new(pos_x_in_slice[neighbor_idx], pos_y_in_slice[neighbor_idx]);
-                        let neighbor_vel = Vec2::new(vel_x_in_slice[neighbor_idx], vel_y_in_slice[neighbor_idx]);
+                        let neighbor_pos = Vec2::new(pos_x_in_slice[neighbor_idx], pos_y_in_slice[neighbor_idx]); // Corrected: neighborIdx
+                        let neighbor_vel = Vec2::new(vel_x_in_slice[neighbor_idx], vel_y_in_slice[neighbor_idx]); // Corrected: neighborIdx
                         
                         let collision_vector = current_pos.sub(neighbor_pos);
                         if collision_vector.length_squared() < 1e-12 {
@@ -620,9 +667,11 @@ impl CpuSimulation {
                             let collision_normal = collision_vector.normalize_or_zero();
                             let collision_tangent = Vec2::new(-collision_normal.y, collision_normal.x);
                             
+
                             let v1_normal = velocity.dot(collision_normal);
+                            let v2_normal = neighbor_vel.dot(collision_normal); // Corrected: neighbor_vel
                             let v1_tangent = velocity.dot(collision_tangent);
-                            let v2_normal = neighbor_vel.dot(collision_normal);
+                            let v2_tangent = neighbor_vel.dot(collision_tangent); // Corrected: neighbor_vel
                             
 
                             let v1_normal_new = ((mass - mass * restitution) * v1_normal + (1.0 + restitution) * mass * v2_normal) / (mass + mass);
@@ -895,11 +944,13 @@ impl CpuSimulation {
         let actual_new_cells_count = new_daughters_data.len();
         for (x, y, orient, is_leader) in new_daughters_data {
             self.state.add_particle(x, y, orient);
-            // Set leader status for the new cell
+            // Set leader status for the new cell if parent was a leader
             if is_leader {
                 let new_idx = self.state.num_particles - 1; // Index of the newly added cell
                 if (new_idx as usize) < self.state.is_leader.len() {
                     self.state.is_leader[new_idx as usize] = 1;
+                    // Also add to the current_leader_indices list
+                    self.state.current_leader_indices.push(new_idx);
                 }
             }
         }
@@ -1212,92 +1263,331 @@ impl CpuSimulation {
         }
         let num_particles = self.state.num_particles as usize;
         let leader_percentage = self.config.bias.leader_percentage.unwrap_or(0.0);
-        
+
         // Clear leader state if disabled, percentage is zero, or no particles
         if leader_percentage <= 0.0 || num_particles == 0 {
-             self.state.is_leader.iter_mut().for_each(|flag| *flag = 0);
-             self.state.current_leader_indices.clear();
-             debug!("Leader bias disabled or no particles. Cleared leader state.");
-             return Ok(());
+            self.state.is_leader.iter_mut().for_each(|flag| *flag = 0);
+            self.state.current_leader_indices.clear();
+            debug!("Leader bias disabled or no particles. Cleared leader state.");
+            return Ok(());
         }
 
-        let num_leaders = ((num_particles as f32 * leader_percentage).round() as usize).max(1).min(num_particles);
+        let num_leaders_to_select = ((num_particles as f32 * leader_percentage).round() as usize)
+            .max(1)
+            .min(num_particles);
 
-        // --- Calculate Distances based on Wound Type --- 
-        // Use current positions (_in buffers)
-        let pos_x_slice = &self.state.positions_x_in;
-        let distances: Vec<(u32, f32)> = match self.config.initial_conditions.wound_type.as_str() {
-            "straight_edge" => {
-                let edge_x_um = self.config.initial_conditions.wound_param1 / 1000.0;
-                (0..num_particles)
-                    .filter_map(|idx| {
-                        // Bounds check for slice access
-                        if idx < pos_x_slice.len() {
-                            let pos_x = pos_x_slice[idx];
-                            if pos_x < edge_x_um { // Only consider cells outside the wound (left side)
-                                let dist = edge_x_um - pos_x; // Distance to the single edge
-                                Some((idx as u32, dist))
-                            } else { None }
-                        } else { None }
-                    })
-                    .collect()
-            }
-            "strip" => {
-                let edge_left_um = self.config.initial_conditions.wound_param1 / 1000.0;
-                let edge_right_um = self.config.initial_conditions.wound_param2 / 1000.0;
-                // Ensure edge1 is the left edge and edge2 is the right edge of the gap
-                let (edge1, edge2) = if edge_left_um < edge_right_um { (edge_left_um, edge_right_um) } else { (edge_right_um, edge_left_um) };
-
-                (0..num_particles)
-                    .filter_map(|idx| {
-                        // Bounds check for slice access
-                        if idx < pos_x_slice.len() {
-                            let pos_x = pos_x_slice[idx];
-                            // Only consider cells outside the wound gap
-                            if pos_x < edge1 { // Cell is to the left of the gap
-                                let dist = edge1 - pos_x; // Distance to the left edge of the gap
-                                Some((idx as u32, dist))
-                            } else if pos_x > edge2 { // Cell is to the right of the gap
-                                let dist = pos_x - edge2; // Distance to the right edge of the gap
-                                Some((idx as u32, dist))
-                            } else { None } // Cell is inside the gap
-                        } else { None }
-                    })
-                    .collect()
-            }
-            _ => {
-                warn!("Leader selection not implemented for wound type: '{}'. Skipping leader update.", self.config.initial_conditions.wound_type);
-                 // Clear leader state if type is unsupported
-                 self.state.is_leader.iter_mut().for_each(|flag| *flag = 0);
-                 self.state.current_leader_indices.clear();
-                return Ok(());
-            }
-        };
-
-        // Sort by distance (ascending - closest to edge first)
-        let mut distances_mut = distances; // Made mutable for sort
-        distances_mut.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-
-        // --- Mark Leaders and Populate Index List --- 
-        // Reset flags first
+        let old_leader_indices = self.state.current_leader_indices.clone();
         self.state.is_leader.iter_mut().for_each(|flag| *flag = 0);
-        // Clear and reserve capacity for the leader index list
         self.state.current_leader_indices.clear();
-        self.state.current_leader_indices.reserve(num_leaders);
 
+        // --- New Leader Selection Logic ---
+        let params = &self.state.params;
+        let pos_x_slice = &self.state.positions_x_in;
+        let pos_y_slice = &self.state.positions_y_in;
+        let cell_counts_slice = &self.state.cell_counts;
+
+        let grid_width_count = (params.world_width / params.grid_cell_size).ceil() as usize;
+        let grid_height_count = (params.world_height / params.grid_cell_size).ceil() as usize;
+        let grid_dims = (grid_width_count, grid_height_count);
+        let total_grid_cells = grid_dims.0 * grid_dims.1;
+
+        // Identify all grid cells occupied by particles
+        let mut all_particle_grid_indices: HashSet<usize> = HashSet::with_capacity(num_particles); // Optimization
+        for p_idx in 0..num_particles {
+            if p_idx < pos_x_slice.len() && p_idx < pos_y_slice.len() {
+                let current_pos = Vec2::new(pos_x_slice[p_idx], pos_y_slice[p_idx]);
+                let grid_idx = get_grid_cell_idx(current_pos, params) as usize;
+                if grid_idx < total_grid_cells {
+                    all_particle_grid_indices.insert(grid_idx);
+                }
+            }
+        }
+
+        if all_particle_grid_indices.is_empty() && num_particles > 0 {
+            debug!("No valid particle grid indices found for {} particles. Skipping leader update.", num_particles);
+            return Ok(());
+        }
+        // num_particles == 0 is already handled, but this check is fine.
+        if num_particles == 0 { return Ok(());}
+
+
+        // Find empty grid cells adjacent to any particle grid cell (these are the seeds for wound BFS)
+        let mut immediate_wound_interface_seeds: HashSet<usize> = HashSet::new();
+        for &particle_grid_idx in &all_particle_grid_indices {
+            let gx = particle_grid_idx % grid_dims.0;
+            let gy = particle_grid_idx / grid_dims.0;
+
+            for dr_offset in -1..=1 {
+                for dc_offset in -1..=1 {
+                    if dr_offset == 0 && dc_offset == 0 { continue; }
+
+                    let ngx_i32 = gx as i32 + dc_offset;
+                    let ngy_i32 = gy as i32 + dr_offset;
+
+                    if ngx_i32 >= 0 && ngx_i32 < grid_dims.0 as i32 && ngy_i32 >= 0 && ngy_i32 < grid_dims.1 as i32 {
+                        let neighbor_grid_idx = (ngy_i32 as usize * grid_dims.0) + ngx_i32 as usize;
+                        if neighbor_grid_idx < cell_counts_slice.len() && cell_counts_slice[neighbor_grid_idx] == 0 {
+                            // MODIFIED: Check if this empty neighbor is within the original wound area
+                            if self.is_grid_idx_in_original_wound_area(neighbor_grid_idx, grid_dims) {
+                                immediate_wound_interface_seeds.insert(neighbor_grid_idx);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if immediate_wound_interface_seeds.is_empty() {
+            debug!("No empty grid cells found adjacent to cell mass AND within original wound area. Skipping leader update.");
+            return Ok(());
+        }
+
+        // 1. Identify Largest Low-Density Region (Wound) using BFS, starting from seeds adjacent to cells
+        let mut largest_wound_component: HashSet<usize> = HashSet::new();
+        let mut max_size = 0;
+        let mut visited_for_adj_bfs: HashSet<usize> = HashSet::new(); // Tracks visited cells for this series of BFS
+
+        for &start_grid_idx in &immediate_wound_interface_seeds {
+            if visited_for_adj_bfs.contains(&start_grid_idx) {
+                continue; // Already processed as part of another component
+            }
+            // Ensure the seed itself is valid for starting BFS (must be empty)
+            if !(start_grid_idx < cell_counts_slice.len() && cell_counts_slice[start_grid_idx] == 0) {
+                 // This should not happen if immediate_wound_interface_seeds is built correctly
+                continue;
+            }
+
+            let mut current_component: HashSet<usize> = HashSet::new();
+            let mut queue: VecDeque<usize> = VecDeque::new();
+
+            queue.push_back(start_grid_idx);
+            visited_for_adj_bfs.insert(start_grid_idx);
+            current_component.insert(start_grid_idx);
+
+            while let Some(curr_g_idx) = queue.pop_front() {
+                let gx = curr_g_idx % grid_dims.0;
+                let gy = curr_g_idx / grid_dims.0;
+
+                for (dr, dc) in [(0, 1), (0, -1), (1, 0), (-1, 0), (1,1), (1,-1), (-1,1), (-1,-1)] {
+                    let ngx_i32 = gx as i32 + dc;
+                    let ngy_i32 = gy as i32 + dr;
+
+                    if ngx_i32 >= 0 && ngx_i32 < grid_dims.0 as i32 && ngy_i32 >= 0 && ngy_i32 < grid_dims.1 as i32 {
+                        let neighbor_grid_idx = (ngy_i32 as usize * grid_dims.0) + ngx_i32 as usize;
+                        if neighbor_grid_idx < cell_counts_slice.len() && cell_counts_slice[neighbor_grid_idx] == 0 && !visited_for_adj_bfs.contains(&neighbor_grid_idx) {
+                            // MODIFIED: Check if this empty, unvisited neighbor is within the original wound area
+                            if self.is_grid_idx_in_original_wound_area(neighbor_grid_idx, grid_dims) {
+                                visited_for_adj_bfs.insert(neighbor_grid_idx);
+                                current_component.insert(neighbor_grid_idx);
+                                queue.push_back(neighbor_grid_idx);
+                            }
+                        }
+                    }
+                }
+            } // End of BFS for one component
+
+            if current_component.len() > max_size {
+                max_size = current_component.len();
+                largest_wound_component = current_component;
+            }
+        } // End of iterating through seeds
+
+        if largest_wound_component.is_empty() {
+            debug!("No significant low-density wound area found adjacent to cells. No leaders selected.");
+            return Ok(());
+        }
+
+        // 2. Identify Interface Cells and Score by Exposure
+        let mut interface_cell_candidates: Vec<(u32, Vec2, f32)> = Vec::new(); // (idx, pos, exposure_score)
+        for p_idx in 0..num_particles {
+            let current_pos = Vec2::new(pos_x_slice[p_idx], pos_y_slice[p_idx]);
+            let cell_grid_idx_u32 = get_grid_cell_idx(current_pos, params);
+            let cell_grid_idx = cell_grid_idx_u32 as usize; // Cast to usize for HashSet
+
+            if !largest_wound_component.contains(&cell_grid_idx) { // Cell is not in the wound itself
+                let mut wound_neighbor_grid_cells = 0;
+                let gx = cell_grid_idx % grid_dims.0; // gx is usize
+                let gy = cell_grid_idx / grid_dims.0; // gy is usize
+
+                for dr_i32 in -1..=1 { // Check 8 neighbors + self's grid cell (though self is not in wound)
+                    for dc_i32 in -1..=1 {
+                        // if dr == 0 && dc == 0 { continue; } // if only checking strict neighbors
+                        let ngx_i32 = gx as i32 + dc_i32;
+                        let ngy_i32 = gy as i32 + dr_i32;
+
+                        if ngx_i32 >= 0 && ngx_i32 < grid_dims.0 as i32 && ngy_i32 >= 0 && ngy_i32 < grid_dims.1 as i32 {
+                            let neighbor_grid_idx = (ngy_i32 as usize * grid_dims.0) + ngx_i32 as usize;
+                            if largest_wound_component.contains(&neighbor_grid_idx) {
+                                wound_neighbor_grid_cells += 1;
+                            }
+                        }
+                    }
+                }
+                if wound_neighbor_grid_cells > 0 {
+                    interface_cell_candidates.push((p_idx as u32, current_pos, wound_neighbor_grid_cells as f32));
+                }
+            }
+        }
+
+        if interface_cell_candidates.is_empty() {
+            debug!("No interface cells found. No leaders selected.");
+            return Ok(());
+        }
+
+        // 3. Select Leaders: "Top" and "Bottom" of the most exposed front
+        let mut final_leader_selection: Vec<(u32, f32)> = Vec::new(); // (idx, sort_metric for final selection)
+        let mut selected_indices_set: HashSet<u32> = HashSet::new();
+
+        // Sort candidates by exposure (higher is better) as primary criterion
+        interface_cell_candidates.sort_unstable_by(|a, b| {
+            b.2.partial_cmp(&a.2) // Exposure descending
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        
+        // Take a pool of most exposed candidates for top/bottom selection
+        // This pool size can be tuned, e.g., 2x to 3x num_leaders_to_select
+        let candidate_pool_size = (num_leaders_to_select * 3).min(interface_cell_candidates.len());
+        let mut top_bottom_candidate_pool: Vec<_> = interface_cell_candidates.iter().take(candidate_pool_size).cloned().collect();
+
+        if !top_bottom_candidate_pool.is_empty() {
+            let num_top_leaders_to_pick = num_leaders_to_select / 2;
+            let num_bottom_leaders_to_pick = num_leaders_to_select - num_top_leaders_to_pick;
+
+            // Select "top" leaders (max Y from the exposed pool)
+            top_bottom_candidate_pool.sort_unstable_by(|a, b| {
+                b.1.y.partial_cmp(&a.1.y) // Y descending
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal)) // Tie-break with exposure
+            });
+            for (idx, _pos, exposure) in top_bottom_candidate_pool.iter().take(num_top_leaders_to_pick) {
+                if selected_indices_set.insert(*idx) {
+                    final_leader_selection.push((*idx, -*exposure)); // Use negative exposure for sorting later
+                }
+            }
+
+            // Select "bottom" leaders (min Y from the exposed pool)
+            top_bottom_candidate_pool.sort_unstable_by(|a, b| {
+                a.1.y.partial_cmp(&b.1.y) // Y ascending
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal)) // Tie-break with exposure
+            });
+            for (idx, _pos, exposure) in top_bottom_candidate_pool.iter() {
+                if final_leader_selection.len() >= num_leaders_to_select { break; }
+                if selected_indices_set.insert(*idx) {
+                    final_leader_selection.push((*idx, -*exposure));
+                }
+            }
+        }
+
+        // If not enough leaders selected (e.g. pool was too small or all cells at same Y),
+        // fill remaining slots with the most exposed cells overall that haven't been picked.
+        if final_leader_selection.len() < num_leaders_to_select {
+            interface_cell_candidates.sort_unstable_by(|a, b| { // Ensure sorted by exposure
+                b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            for (idx, _pos, exposure) in interface_cell_candidates.iter() {
+                if final_leader_selection.len() >= num_leaders_to_select { break; }
+                if selected_indices_set.insert(*idx) {
+                    final_leader_selection.push((*idx, -*exposure));
+                }
+            }
+        }
+        
+        // Sort the final list by the metric (negative exposure, so ascending sort picks highest exposure)
+        final_leader_selection.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        // --- Mark Leaders and Populate Index List ---
+        // (The existing logic from here should work with `final_leader_selection`)
         let mut leaders_marked = 0;
-        for (leader_idx_u32, _dist) in distances_mut.iter().take(num_leaders) { // Use distances_mut
+        
+        // If we have too few candidates, mark all available ones
+        if final_leader_selection.len() < num_leaders_to_select {
+            debug!(
+                "Only {} unique leader candidates identified by new logic (needed {}), marking all available.",
+                final_leader_selection.len(),
+                num_leaders_to_select
+            );
+        }
+
+        self.state.current_leader_indices.reserve(final_leader_selection.len()); // Reserve based on actual found leaders
+
+        for (leader_idx_u32, _dist) in final_leader_selection.iter().take(num_leaders_to_select) { // Take up to num_leaders_to_select
             let leader_idx = *leader_idx_u32 as usize;
             if leader_idx < self.state.is_leader.len() { // Bounds check before marking
-                 self.state.is_leader[leader_idx] = 1;
-                 self.state.current_leader_indices.push(*leader_idx_u32); // Add to the cached list
-                 leaders_marked += 1;
+                self.state.is_leader[leader_idx] = 1;
+                self.state.current_leader_indices.push(*leader_idx_u32); // Add to the cached list
+                leaders_marked += 1;
             } else {
                 warn!("Leader index {} out of bounds during marking. Skipping.", leader_idx);
             }
         }
-        debug!("Updated leaders: {} cells marked (target: {}). Leader index list size: {}", leaders_marked, num_leaders, self.state.current_leader_indices.len());
+        
+        // Log how many leader cells changed
+        let mut changed_leaders = 0;
+        let mut new_leaders_count = 0;
+        let old_leader_indices_set: HashSet<u32> = old_leader_indices.into_iter().collect();
+
+        for &new_leader_idx in &self.state.current_leader_indices {
+            if !old_leader_indices_set.contains(&new_leader_idx) {
+                new_leaders_count += 1;
+            }
+        }
+        let lost_leaders_count = old_leader_indices_set.len().saturating_sub(
+            self.state.current_leader_indices.iter().filter(|idx| old_leader_indices_set.contains(idx)).count()
+        );
+        changed_leaders = new_leaders_count + lost_leaders_count;
+        
+        debug!(
+            "Updated leaders (new logic): {} cells marked (target: {}). {} new, {} lost. Total changed: {}. Leader index list size: {}.",
+            leaders_marked,
+            num_leaders_to_select,
+            new_leaders_count,
+            lost_leaders_count,
+            changed_leaders,
+            self.state.current_leader_indices.len()
+        );
         Ok(())
+    }
+
+    /// Helper method to determine if a grid cell is within the initially defined wound area.
+    fn is_grid_idx_in_original_wound_area(&self, grid_idx: usize, grid_dims: (usize, usize)) -> bool {
+        let params = &self.state.params;
+        let initial_conditions = &self.config.initial_conditions;
+
+        let (grid_width_count, _grid_height_count) = grid_dims;
+        let gx = grid_idx % grid_width_count;
+        // let gy = grid_idx / grid_width_count; // gy is not used for current wound types
+
+        // Calculate the center x-coordinate of the grid cell in world units (µm)
+        let cell_center_x_um = (gx as f32 + 0.5) * params.grid_cell_size;
+
+        match initial_conditions.wound_type.as_str() {
+            "straight_edge" => {
+                let edge_x_um = initial_conditions.wound_param1 / 1000.0; // param1 is edge x in nm
+                // Wound is to the right of the edge (or at the edge)
+                cell_center_x_um >= edge_x_um
+            }
+            "strip" => {
+                let edge1_um = initial_conditions.wound_param1 / 1000.0; // param1 is edge1_x in nm
+                let edge2_um = initial_conditions.wound_param2 / 1000.0; // param2 is edge2_x in nm
+                let left_edge_um = edge1_um.min(edge2_um);
+                let right_edge_um = edge1_um.max(edge2_um);
+                // Wound is between the two edges (exclusive of edges themselves, typically)
+                cell_center_x_um > left_edge_um && cell_center_x_um < right_edge_um
+            }
+            // Add other wound types here if they define a spatial area for leader selection
+            _ => {
+                // If wound type doesn't define a clear spatial region for this purpose,
+                // or is unhandled, assume the grid cell is NOT in a restrictable wound area.
+                debug!(
+                    "Wound type '{}' not explicitly handled for spatial restriction in leader selection. Grid cell {} (center x: {:.2}µm) considered outside restricted wound area.",
+                    initial_conditions.wound_type,
+                    grid_idx,
+                    cell_center_x_um
+                );
+                false
+            }
+        }
     }
 
     /// Calculate a lower resolution density grid for faster global computations
@@ -1493,7 +1783,7 @@ fn place_initial_cells(
     let cell_h = height / rows as f32;
     for (ix, iy) in bins {
         let x0 = x_min + ix as f32 * cell_w;
-        let y0 = y_min + iy as f32 * cell_h;
+               let y0 = y_min + iy as f32 * cell_h;
         let x1 = x0 + cell_w;
         let y1 = y0 + cell_h;
         let dist_x = Uniform::new(x0, x1)?;
@@ -1600,7 +1890,6 @@ fn calculate_improved_density_gradient_bias(
     let total_cells = grid_dim_x * grid_dim_y;
     
     if grid_idx >= total_cells && !(position.x == params.world_width && position.y == params.world_height) { // Allow exact corner for precomputation
-        // If position is exactly at the world corner during precomputation, grid_idx might be total_cells.
         // This is okay if we handle it in the gradient fetching.
         // Otherwise, if it's truly out of bounds, return zero.
         if grid_idx >= total_cells {
@@ -1755,14 +2044,16 @@ fn find_lowest_density_point(
     
     let min_cell_with_dist = (0..(grid_dim_x * grid_dim_y)) // Iterate over all grid indices
         .into_par_iter()
-        .filter_map(|idx| {
-            if idx < cell_density.len() && (cell_density[idx] - min_density).abs() < 1e-6 {
-                let x = idx % grid_dim_x;
-                let y = idx / grid_dim_x;
-                let dist_to_centroid_sq = (x as f32 - centroid_x_g).powi(2) + (y as f32 - centroid_y_g).powi(2);
-                Some((x, y, dist_to_centroid_sq))
-            } else {
-                None
+        .filter_map({
+            move |idx| {
+                if idx < cell_density.len() && (cell_density[idx] - min_density).abs() < 1e-6 {
+                    let x = idx % grid_dim_x;
+                    let y = idx / grid_dim_x;
+                    let dist_to_centroid_sq = (x as f32 - centroid_x_g).powi(2) + (y as f32 - centroid_y_g).powi(2);
+                    Some((x, y, dist_to_centroid_sq))
+                } else {
+                    None
+                }
             }
         })
         .min_by(|&(_, _, dist1_sq), &(_, _, dist2_sq)| {

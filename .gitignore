@@ -6,3 +6,5 @@ Cargo.lock
 *.bin
 *.json
 *.csv
+*.png
+/final_videos

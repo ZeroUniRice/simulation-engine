@@ -17,7 +17,7 @@ density_bias_strength = 30.0 # Strength of bias towards lower density
 [bias]
 # Primary bias mode determines the main directional influence during interactions.
 # Options: "none", "leaders", "densitygradient"
-primary_bias = "leaders"
+primary_bias = "none"
 density_gradient_update_interval_steps = 10
 
 # --- Settings for primary_bias = "leaders" ---
@@ -31,7 +31,7 @@ leader_bias_strength = 3.0
 
 # --- Settings for secondary adhesion bias ---
 # Enable adhesion mechanism?
-enable_adhesion = false
+enable_adhesion = true
 # Probability (0-1) that a cell adheres to a neighbor upon collision.
 adhesion_probability = 0.1
 # Strength (0-1) of the adhesion effect, influencing movement direction towards the adhered neighbor.
@@ -48,14 +48,14 @@ num_cells_initial = 50
 wound_type = "straight_edge" # Cells start on left half
 wound_param1 = 500000.0      # X position of the edge (in nm)
 wound_param2 = 0.0           # Unused for straight_edge
-initial_placement_seed = 54321
+initial_placement_seed = 54350
 
 # Removed GPU section, added Rayon config (optional, Rayon usually auto-detects)
 [cpu]
 # num_threads = 8 # Optional: Set number of threads for Rayon thread pool
 
 [output]
-base_filename = "wound_healing_sim_cpu_leader"
+base_filename = "wound_healing_sim_cpu_nobias_adhesion"
 save_positions = true
 save_stats = true
 save_positions_in_snapshot = true

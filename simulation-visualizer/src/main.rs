@@ -348,7 +348,7 @@ fn generate_summary_plot(
     total_particles: &[u32],
     cells_in_wound: &[u32],
     avg_density: &[f32],
-    avg_neighbors: &[f32],
+    avg_neighbors: &[f32], // Still keeping the parameter for compatibility
 ) -> Result<(), Box<dyn std::error::Error>> {
     if times.is_empty() {
         warn!("No data available for plotting.");
@@ -360,18 +360,19 @@ fn generate_summary_plot(
 
     let (time_min, time_max) = get_min_max_f32(times);
 
-    let (upper_charts, lower_charts) = root_area.split_vertically(480);
+    // Reorganize into a 3-plot layout with a 2x2 grid where bottom-right is empty
+    let areas = root_area.split_evenly((2, 2));
     let charts_areas = [
-        upper_charts.split_horizontally(640).0, // Top-left
-        upper_charts.split_horizontally(640).1, // Top-right
-        lower_charts.split_horizontally(640).0, // Bottom-left
-        lower_charts.split_horizontally(640).1, // Bottom-right
+        &areas[0], // Top-left: Total Particles
+        &areas[1], // Top-right: Cells in Wound
+        &areas[2], // Bottom-left: Average Density
+        // No longer using areas[3] (bottom-right)
     ];
 
     // Plot 1: Total Particles vs Time
     if !total_particles.is_empty() {
         let (y_min, y_max) = get_min_max_u32(total_particles);
-        let mut chart = ChartBuilder::on(&charts_areas[0])
+        let mut chart = ChartBuilder::on(charts_areas[0])
             .caption("Total Particles vs Time", ("sans-serif", 30))
             .margin(10)
             .x_label_area_size(30)
@@ -387,8 +388,8 @@ fn generate_summary_plot(
     // Plot 2: Cells in Wound vs Time
     if !cells_in_wound.is_empty() {
         let (y_min, y_max) = get_min_max_u32(cells_in_wound);
-        let mut chart = ChartBuilder::on(&charts_areas[1])
-            .caption("Cells in Wound vs Time", ("sans-serif", 30)) // Corrected font usage
+        let mut chart = ChartBuilder::on(charts_areas[1])
+            .caption("Cells in Wound vs Time", ("sans-serif", 30))
             .margin(10)
             .x_label_area_size(30)
             .y_label_area_size(40)
@@ -403,8 +404,8 @@ fn generate_summary_plot(
     // Plot 3: Average Density in Wound vs Time
     if !avg_density.is_empty() {
         let (y_min, y_max) = get_min_max_f32(avg_density);
-        let mut chart = ChartBuilder::on(&charts_areas[2])
-            .caption("Avg Density in Wound vs Time", ("sans-serif", 30)) // Corrected font usage
+        let mut chart = ChartBuilder::on(charts_areas[2])
+            .caption("Avg Density in Wound vs Time", ("sans-serif", 30))
             .margin(10)
             .x_label_area_size(30)
             .y_label_area_size(40)
@@ -416,21 +417,7 @@ fn generate_summary_plot(
         ))?;
     }
     
-    // Plot 4: Average Neighbors vs Time
-    if !avg_neighbors.is_empty() {
-        let (y_min, y_max) = get_min_max_f32(avg_neighbors);
-        let mut chart = ChartBuilder::on(&charts_areas[3])
-            .caption("Average Neighbors vs Time", ("sans-serif", 30)) // Corrected font usage
-            .margin(10)
-            .x_label_area_size(30)
-            .y_label_area_size(40)
-            .build_cartesian_2d(time_min..time_max, y_min..y_max)?;
-        chart.configure_mesh().draw()?;
-        chart.draw_series(LineSeries::new(
-            times.iter().zip(avg_neighbors.iter()).map(|(&t, &n)| (t, n)),
-            &colors::MAGENTA,
-        ))?;
-    }
+    // Fourth plot (Average Neighbors vs Time) removed
 
     root_area.present().context("Failed to write plot to backend")?;
     info!("Summary plot generated at {}", output_path.display());
